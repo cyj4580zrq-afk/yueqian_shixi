@@ -1,0 +1,1110 @@
+/*
+ * ui_client.c — 车机风格 AI 助手触屏界面 (RK1808)
+ * ==================================================
+ * 屏幕:   1024x600 DRM Framebuffer (BGRA, 4 bytes/pixel)
+ * 触屏:   /dev/input/event2 (ABS_X / ABS_Y / BTN_TOUCH)
+ * 功能:   录音 -> SCP 传输 -> 接收 AI 回复 -> 语音播报 -> LED 控制
+ * 编译:   make ui_client  (aarch64 交叉编译, -lpthread -lDRMwrap -ldrm)
+ *
+ * 布局:
+ *   [ 0-  70]  顶栏   — 标题 + 状态指示
+ *   [70- 460]  主区域 — 两张大圆角卡片 (录音/发送)
+ *   [460-520]  状态栏 — 颜色编码状态反馈 + 中文状态文字
+ *   [520-600]  导航栏 — 底部导航图标 + 中文标签
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <arpa/inet.h>
+#include <errno.h>
+#include <stdint.h>
+#include <pthread.h>
+#include <fcntl.h>
+#include <sys/ioctl.h>
+#include <linux/input.h>
+#include "./DRMwrap.h"
+
+/* ============================ 常量 ============================ */
+#define SCREEN_W      1024
+#define SCREEN_H      600
+#define CONTROL_PORT  8888
+#define TOUCH_DEVICE  "/dev/input/event2"
+#define DRM_DEVICE    "/dev/dri/card0"
+
+/* ============================ 中文字符索引 ============================ */
+#define CN_YU    0   /* 语 */
+#define CN_YIN   1   /* 音 */
+#define CN_ZHU   2   /* 助 */
+#define CN_SHOU  3   /* 手 */
+#define CN_LU    4   /* 录 */
+#define CN_FA    5   /* 发 */
+#define CN_SONG  6   /* 送 */
+#define CN_JIU   7   /* 就 */
+#define CN_XU    8   /* 绪 */
+#define CN_ZHONG 9   /* 中 */
+#define CN_CUO   10  /* 错 */
+#define CN_WU    11  /* 误 */
+#define CN_SHOU2 12  /* 首 */
+#define CN_YE    13  /* 页 */
+#define CN_SHE   14  /* 设 */
+#define CN_ZHI   15  /* 置 */
+
+/* ================================================================
+ *  ASCII 5x7 点阵字体
+ *  每个字符 7 字节 (7 行), bit4=左, bit0=右, 共 5 列
+ *  索引: 字符 ASCII 码 - 32  (覆盖 32-126)
+ * ================================================================ */
+static const uint8_t font5x7[95][7] = {
+    /* 32 space */ {0x00,0x00,0x00,0x00,0x00,0x00,0x00},
+    /* 33 !     */ {0x00,0x00,0x17,0x00,0x00,0x00,0x00},
+    /* 34 "     */ {0x00,0x03,0x00,0x03,0x00,0x00,0x00},
+    /* 35 #     */ {0x0A,0x1F,0x0A,0x1F,0x0A,0x00,0x00},
+    /* 36 $     */ {0x12,0x15,0x1F,0x15,0x09,0x00,0x00},
+    /* 37 %     */ {0x11,0x09,0x04,0x12,0x11,0x00,0x00},
+    /* 38 &     */ {0x1B,0x14,0x1B,0x12,0x1D,0x00,0x00},
+    /* 39 '     */ {0x00,0x00,0x03,0x00,0x00,0x00,0x00},
+    /* 40 (     */ {0x00,0x0E,0x11,0x00,0x00,0x00,0x00},
+    /* 41 )     */ {0x00,0x11,0x0E,0x00,0x00,0x00,0x00},
+    /* 42 *     */ {0x04,0x0A,0x04,0x0A,0x04,0x00,0x00},
+    /* 43 +     */ {0x04,0x04,0x1F,0x04,0x04,0x00,0x00},
+    /* 44 ,     */ {0x00,0x18,0x08,0x00,0x00,0x00,0x00},
+    /* 45 -     */ {0x04,0x04,0x04,0x04,0x04,0x00,0x00},
+    /* 46 .     */ {0x00,0x10,0x00,0x00,0x00,0x00,0x00},
+    /* 47 /     */ {0x10,0x08,0x04,0x02,0x01,0x00,0x00},
+    /* 48 0     */ {0x0E,0x11,0x15,0x11,0x0E,0x00,0x00},
+    /* 49 1     */ {0x00,0x12,0x1F,0x10,0x00,0x00,0x00},
+    /* 50 2     */ {0x19,0x15,0x15,0x15,0x12,0x00,0x00},
+    /* 51 3     */ {0x11,0x15,0x15,0x15,0x0A,0x00,0x00},
+    /* 52 4     */ {0x06,0x0A,0x12,0x1F,0x02,0x00,0x00},
+    /* 53 5     */ {0x17,0x15,0x15,0x15,0x09,0x00,0x00},
+    /* 54 6     */ {0x0E,0x15,0x15,0x15,0x08,0x00,0x00},
+    /* 55 7     */ {0x01,0x19,0x05,0x03,0x01,0x00,0x00},
+    /* 56 8     */ {0x0A,0x15,0x15,0x15,0x0A,0x00,0x00},
+    /* 57 9     */ {0x02,0x15,0x15,0x15,0x0E,0x00,0x00},
+    /* 58 :     */ {0x00,0x0A,0x00,0x00,0x00,0x00,0x00},
+    /* 59 ;     */ {0x00,0x1A,0x0A,0x00,0x00,0x00,0x00},
+    /* 60 <     */ {0x04,0x0A,0x11,0x00,0x00,0x00,0x00},
+    /* 61 =     */ {0x0A,0x0A,0x0A,0x0A,0x0A,0x00,0x00},
+    /* 62 >     */ {0x11,0x0A,0x04,0x00,0x00,0x00,0x00},
+    /* 63 ?     */ {0x01,0x01,0x15,0x05,0x02,0x00,0x00},
+    /* 64 @     */ {0x0E,0x11,0x17,0x15,0x0E,0x00,0x00},
+    /* 65 A     */ {0x1E,0x05,0x05,0x05,0x1E,0x00,0x00},
+    /* 66 B     */ {0x1F,0x15,0x15,0x15,0x0A,0x00,0x00},
+    /* 67 C     */ {0x0E,0x11,0x11,0x11,0x0A,0x00,0x00},
+    /* 68 D     */ {0x1F,0x11,0x11,0x11,0x0E,0x00,0x00},
+    /* 69 E     */ {0x1F,0x15,0x15,0x15,0x11,0x00,0x00},
+    /* 70 F     */ {0x1F,0x05,0x05,0x05,0x01,0x00,0x00},
+    /* 71 G     */ {0x0E,0x11,0x15,0x15,0x1C,0x00,0x00},
+    /* 72 H     */ {0x1F,0x04,0x04,0x04,0x1F,0x00,0x00},
+    /* 73 I     */ {0x11,0x11,0x1F,0x11,0x11,0x00,0x00},
+    /* 74 J     */ {0x08,0x10,0x10,0x10,0x0F,0x00,0x00},
+    /* 75 K     */ {0x1F,0x04,0x0A,0x11,0x10,0x00,0x00},
+    /* 76 L     */ {0x1F,0x10,0x10,0x10,0x10,0x00,0x00},
+    /* 77 M     */ {0x1F,0x02,0x04,0x02,0x1F,0x00,0x00},
+    /* 78 N     */ {0x1F,0x02,0x04,0x08,0x1F,0x00,0x00},
+    /* 79 O     */ {0x0E,0x11,0x11,0x11,0x0E,0x00,0x00},
+    /* 80 P     */ {0x1F,0x05,0x05,0x05,0x02,0x00,0x00},
+    /* 81 Q     */ {0x0E,0x11,0x19,0x11,0x1E,0x00,0x00},
+    /* 82 R     */ {0x1F,0x05,0x0D,0x15,0x12,0x00,0x00},
+    /* 83 S     */ {0x12,0x15,0x15,0x15,0x09,0x00,0x00},
+    /* 84 T     */ {0x01,0x01,0x1F,0x01,0x01,0x00,0x00},
+    /* 85 U     */ {0x0F,0x10,0x10,0x10,0x0F,0x00,0x00},
+    /* 86 V     */ {0x07,0x08,0x10,0x08,0x07,0x00,0x00},
+    /* 87 W     */ {0x0F,0x10,0x0C,0x10,0x0F,0x00,0x00},
+    /* 88 X     */ {0x11,0x0A,0x04,0x0A,0x11,0x00,0x00},
+    /* 89 Y     */ {0x01,0x02,0x1C,0x02,0x01,0x00,0x00},
+    /* 90 Z     */ {0x19,0x15,0x15,0x13,0x11,0x00,0x00},
+    /* 91 [     */ {0x00,0x1F,0x11,0x11,0x00,0x00,0x00},
+    /* 92 \     */ {0x01,0x02,0x04,0x08,0x10,0x00,0x00},
+    /* 93 ]     */ {0x00,0x11,0x11,0x1F,0x00,0x00,0x00},
+    /* 94 ^     */ {0x02,0x01,0x02,0x00,0x00,0x00,0x00},
+    /* 95 _     */ {0x10,0x10,0x10,0x10,0x10,0x00,0x00},
+    /* 96 `     */ {0x00,0x01,0x02,0x00,0x00,0x00,0x00},
+    /* 97 a     */ {0x08,0x15,0x15,0x15,0x1E,0x00,0x00},
+    /* 98 b     */ {0x1F,0x10,0x11,0x11,0x0E,0x00,0x00},
+    /* 99 c     */ {0x0E,0x11,0x11,0x11,0x08,0x00,0x00},
+    /* 100 d    */ {0x0E,0x11,0x11,0x10,0x1F,0x00,0x00},
+    /* 101 e    */ {0x0E,0x15,0x15,0x15,0x0C,0x00,0x00},
+    /* 102 f    */ {0x04,0x1E,0x05,0x01,0x00,0x00,0x00},
+    /* 103 g    */ {0x02,0x29,0x29,0x29,0x1E,0x00,0x00},
+    /* 104 h    */ {0x1F,0x02,0x01,0x01,0x1E,0x00,0x00},
+    /* 105 i    */ {0x00,0x11,0x1F,0x10,0x00,0x00,0x00},
+    /* 106 j    */ {0x10,0x20,0x21,0x1F,0x00,0x00,0x00},
+    /* 107 k    */ {0x1F,0x04,0x0A,0x11,0x00,0x00,0x00},
+    /* 108 l    */ {0x00,0x11,0x1F,0x10,0x00,0x00,0x00},
+    /* 109 m    */ {0x1F,0x01,0x1E,0x01,0x1E,0x00,0x00},
+    /* 110 n    */ {0x1F,0x02,0x01,0x01,0x1E,0x00,0x00},
+    /* 111 o    */ {0x0E,0x11,0x11,0x11,0x0E,0x00,0x00},
+    /* 112 p    */ {0x3F,0x12,0x11,0x11,0x0E,0x00,0x00},
+    /* 113 q    */ {0x0E,0x11,0x11,0x12,0x3F,0x00,0x00},
+    /* 114 r    */ {0x1F,0x02,0x01,0x01,0x02,0x00,0x00},
+    /* 115 s    */ {0x12,0x15,0x15,0x15,0x09,0x00,0x00},
+    /* 116 t    */ {0x01,0x0F,0x11,0x10,0x08,0x00,0x00},
+    /* 117 u    */ {0x0F,0x10,0x10,0x08,0x1F,0x00,0x00},
+    /* 118 v    */ {0x07,0x08,0x10,0x08,0x07,0x00,0x00},
+    /* 119 w    */ {0x0F,0x10,0x0E,0x10,0x0F,0x00,0x00},
+    /* 120 x    */ {0x11,0x0A,0x04,0x0A,0x11,0x00,0x00},
+    /* 121 y    */ {0x03,0x24,0x24,0x24,0x1F,0x00,0x00},
+    /* 122 z    */ {0x19,0x15,0x15,0x13,0x11,0x00,0x00},
+    /* 123 {    */ {0x04,0x0E,0x1B,0x11,0x00,0x00,0x00},
+    /* 124 |    */ {0x00,0x00,0x1F,0x00,0x00,0x00,0x00},
+    /* 125 }    */ {0x11,0x1B,0x0E,0x04,0x00,0x00,0x00},
+    /* 126 ~    */ {0x02,0x01,0x02,0x04,0x02,0x00,0x00},
+};
+
+/* ================================================================
+ *  中文 16x16 点阵字体
+ *  每个汉字 16 行, 每行 2 字节, bit15=左, bit0=右
+ *  在内存中: byte0=高字节(列15-8), byte1=低字节(列7-0)
+ * ================================================================ */
+static const uint16_t cn_font16[16][16] = {
+    /* [ 0] 语 */ {0x23FC, 0x3040, 0x1040, 0x03FC, 0x00CC, 0x708C, 0x12CE, 0x1000, 0x1000, 0x11FC, 0x1D04, 0x1904, 0x110C, 0x11FC, 0x0104, 0x0000},
+    /* [ 1] 音 */ {0x0000, 0x0100, 0x0180, 0x3FFC, 0x0C20, 0x0420, 0x0660, 0x6006, 0x0000, 0x1FF8, 0x1818, 0x1FF8, 0x1818, 0x1818, 0x1FF8, 0x0000},
+    /* [ 2] 助 */ {0x0020, 0x3E20, 0x2620, 0x22F0, 0x26F6, 0x3E26, 0x2226, 0x2224, 0x3E24, 0x2264, 0x2244, 0x2F44, 0x788C, 0x419C, 0x0000, 0x0000},
+    /* [ 3] 手 */ {0x0000, 0x03FC, 0x1F80, 0x0080, 0x0180, 0x1FFC, 0x0080, 0x0080, 0x7FFE, 0x0180, 0x0080, 0x0080, 0x0180, 0x0380, 0x0000, 0x0000},
+    /* [ 4] 录 */ {0x0000, 0x1FF8, 0x0008, 0x1FF8, 0x0018, 0x0018, 0x7FFE, 0x0180, 0x1998, 0x09F0, 0x07E0, 0x19B0, 0x718E, 0x0384, 0x0000, 0x0000},
+    /* [ 5] 发 */ {0x0000, 0x1130, 0x1118, 0x1100, 0x3FFE, 0x0200, 0x0200, 0x07F8, 0x0E10, 0x0B10, 0x11A0, 0x60C0, 0x01E0, 0x0E1C, 0x0000, 0x0000},
+    /* [ 6] 送 */ {0x0000, 0x2110, 0x1190, 0x13FC, 0x0040, 0x0040, 0x73EC, 0x17FC, 0x10E0, 0x10B0, 0x110C, 0x1200, 0x3C00, 0x67FE, 0x0000, 0x0000},
+    /* [ 7] 就 */ {0x0000, 0x0820, 0x0C28, 0x6D24, 0x0024, 0x0030, 0x3FFE, 0x2120, 0x2338, 0x3E38, 0x0A30, 0x2B70, 0x6950, 0x48DA, 0x198E, 0x0000},
+    /* [ 8] 绪 */ {0x0040, 0x1044, 0x31F4, 0x2448, 0x6458, 0x7BFE, 0x1820, 0x10E0, 0x318C, 0x7F84, 0x03FC, 0x0484, 0x7DFC, 0x018C, 0x0000, 0x0000},
+    /* [ 9] 中 */ {0x0180, 0x0180, 0x0180, 0x3FFC, 0x218C, 0x2184, 0x2184, 0x2184, 0x3FFC, 0x2184, 0x0180, 0x0180, 0x0180, 0x0180, 0x0000, 0x0000},
+    /* [10] 错 */ {0x1008, 0x10C8, 0x31FC, 0x78D8, 0x4088, 0x3DFE, 0x1000, 0x1000, 0x7DFC, 0x1104, 0x11FC, 0x1D84, 0x1984, 0x11FC, 0x0000, 0x0000},
+    /* [11] 误 */ {0x2000, 0x33FC, 0x1208, 0x020C, 0x03F8, 0x7000, 0x13FC, 0x1040, 0x1040, 0x17FE, 0x10E0, 0x18B0, 0x3118, 0x060E, 0x0000, 0x0000},
+    /* [12] 首 */ {0x0000, 0x0820, 0x0420, 0x0460, 0x7FFE, 0x0100, 0x0FF0, 0x1818, 0x1810, 0x1FF0, 0x1810, 0x1FF0, 0x1810, 0x1818, 0x1FF8, 0x0000},
+    /* [13] 页 */ {0x0000, 0x7FFE, 0x0180, 0x0100, 0x1FF8, 0x1808, 0x1008, 0x1188, 0x1108, 0x1108, 0x1308, 0x0260, 0x0C38, 0x780C, 0x0000, 0x0000},
+    /* [14] 设 */ {0x2000, 0x31F0, 0x1910, 0x0110, 0x0310, 0x761E, 0x1000, 0x13F8, 0x1118, 0x1190, 0x14B0, 0x1C60, 0x18F0, 0x130E, 0x0000, 0x0000},
+    /* [15] 置 */ {0x0000, 0x0000, 0x366C, 0x3244, 0x1FFC, 0x0180, 0x3FFC, 0x0180, 0x0810, 0x0FF0, 0x0810, 0x0FF0, 0x0FF0, 0x0810, 0x7FFE, 0x0000},
+};
+
+/* ============================ 全局变量 ============================ */
+struct drmHandle DRM;
+int lcd_fb  = -1;
+int touch_fd = -1;
+pthread_mutex_t ui_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* 触屏量程 (运行时通过 ioctl 读取) */
+static int ts_min_x = 0, ts_max_x = 1023;
+static int ts_min_y = 0, ts_max_y = 599;
+
+/* 按钮区域 (触摸命中检测用) */
+typedef struct { int x1, y1, x2, y2; } rect_t;
+static const rect_t BTN_RECORD = {  72, 100, 492, 440 };
+static const rect_t BTN_SEND   = { 532, 100, 952, 440 };
+
+/* ============================ 函数声明 ============================ */
+/* DRM */
+static int  DRM_LCD_DEV_Init(void);
+static void DRM_LCD_DEV_Del(int fb);
+
+/* 触屏 */
+static void init_touch_scaling(void);
+static int  scale_x(int raw);
+static int  scale_y(int raw);
+
+/* 基础绘图 */
+static void set_pixel(int x, int y, int r, int g, int b);
+static void clear_screen(int r, int g, int b);
+static void fill_rect(int x1, int y1, int x2, int y2, int r, int g, int b);
+static void hline(int x1, int x2, int y, int r, int g, int b);
+static void vline(int x, int y1, int y2, int r, int g, int b);
+static void fill_circle(int cx, int cy, int rad, int r, int g, int b);
+static void circle_ring(int cx, int cy, int rad, int thick, int r, int g, int b);
+static void fill_rrect(int x1, int y1, int x2, int y2, int rad, int r, int g, int b);
+static void gradient_v(int x1, int y1, int x2, int y2,
+                       int r1, int g1, int b1, int r2, int g2, int b2);
+static void triangle_right(int x, int y, int h, int w, int r, int g, int b);
+
+/* 文字渲染 */
+static void draw_ascii_char(int x, int y, char ch, int r, int g, int b, int scale);
+static void draw_text(int x, int y, const char *str, int r, int g, int b, int scale);
+static void draw_cn(int x, int y, int idx, int r, int g, int b, int scale);
+static int  text_width_ascii(const char *str, int scale);
+static int  text_width_cn(int count, int scale);
+
+/* 图标 */
+static void icon_mic(int cx, int cy, int r, int g, int b);
+static void icon_send(int cx, int cy, int r, int g, int b);
+static void icon_home(int cx, int cy, int r, int g, int b);
+static void icon_gear(int cx, int cy, int r, int g, int b);
+
+/* UI 渲染 */
+static void redraw_ui(int state, int pressed);
+static void draw_topbar(void);
+static void draw_cards(int pressed);
+static void draw_statusbar(int state);
+static void draw_navbar(void);
+
+/* 网络 */
+static void *listener_thread(void *arg);
+
+/* ================================================================
+ *  DRM 初始化与释放
+ * ================================================================ */
+static int DRM_LCD_DEV_Init(void) {
+    int fd = open(DRM_DEVICE, O_RDWR);
+    if (fd < 0) {
+        perror("[DRM] open");
+        return -1;
+    }
+    DRMinit(fd);
+    DRMcreateFB(fd, &DRM);
+    return fd;
+}
+
+static void DRM_LCD_DEV_Del(int fd) {
+    if (fd < 3) return;
+    DRMfreeResources(fd, &DRM);
+    close(fd);
+}
+
+/* ================================================================
+ *  触屏坐标缩放
+ *  通过 ioctl 读取触摸设备的实际量程, 将原始坐标映射到屏幕坐标
+ * ================================================================ */
+static void init_touch_scaling(void) {
+    struct input_absinfo ai;
+    if (ioctl(touch_fd, EVIOCGABS(ABS_X), &ai) == 0) {
+        ts_min_x = ai.minimum;
+        ts_max_x = ai.maximum;
+    }
+    if (ioctl(touch_fd, EVIOCGABS(ABS_Y), &ai) == 0) {
+        ts_min_y = ai.minimum;
+        ts_max_y = ai.maximum;
+    }
+    printf("[Touch] X range: %d - %d | Y range: %d - %d\n",
+           ts_min_x, ts_max_x, ts_min_y, ts_max_y);
+}
+
+static int scale_x(int raw) {
+    if (ts_max_x <= ts_min_x) return raw;
+    return (raw - ts_min_x) * SCREEN_W / (ts_max_x - ts_min_x);
+}
+
+static int scale_y(int raw) {
+    if (ts_max_y <= ts_min_y) return raw;
+    return (raw - ts_min_y) * SCREEN_H / (ts_max_y - ts_min_y);
+}
+
+/* ================================================================
+ *  基础绘图函数
+ *  所有函数直接操作 DRM 显存 (BGRA 格式: byte0=B, byte1=G, byte2=R)
+ * ================================================================ */
+
+/* 设置单个像素 */
+static void set_pixel(int x, int y, int r, int g, int b) {
+    if ((unsigned)x >= SCREEN_W || (unsigned)y >= SCREEN_H) return;
+    char *s = DRM.vaddr;
+    if (!s) return;
+    int p = 4 * (SCREEN_W * y + x);
+    s[p] = b; s[p+1] = g; s[p+2] = r; s[p+3] = 0;
+}
+
+/* 清屏 */
+static void clear_screen(int r, int g, int b) {
+    char *s = DRM.vaddr;
+    if (!s) return;
+    for (int i = 0; i < SCREEN_W * SCREEN_H; i++) {
+        s[4*i]   = b;
+        s[4*i+1] = g;
+        s[4*i+2] = r;
+        s[4*i+3] = 0;
+    }
+}
+
+/* 填充矩形 */
+static void fill_rect(int x1, int y1, int x2, int y2, int r, int g, int b) {
+    char *s = DRM.vaddr;
+    if (!s) return;
+    for (int y = y1; y < y2; y++) {
+        if ((unsigned)y >= SCREEN_H) continue;
+        for (int x = x1; x < x2; x++) {
+            if ((unsigned)x >= SCREEN_W) continue;
+            int p = 4 * (SCREEN_W * y + x);
+            s[p] = b; s[p+1] = g; s[p+2] = r; s[p+3] = 0;
+        }
+    }
+}
+
+/* 水平线 */
+static void hline(int x1, int x2, int y, int r, int g, int b) {
+    if ((unsigned)y >= SCREEN_H) return;
+    char *s = DRM.vaddr;
+    if (!s) return;
+    for (int x = x1; x < x2; x++) {
+        if ((unsigned)x >= SCREEN_W) continue;
+        int p = 4 * (SCREEN_W * y + x);
+        s[p] = b; s[p+1] = g; s[p+2] = r; s[p+3] = 0;
+    }
+}
+
+/* 垂直线 */
+static void vline(int x, int y1, int y2, int r, int g, int b) {
+    if ((unsigned)x >= SCREEN_W) return;
+    char *s = DRM.vaddr;
+    if (!s) return;
+    for (int y = y1; y < y2; y++) {
+        if ((unsigned)y >= SCREEN_H) continue;
+        int p = 4 * (SCREEN_W * y + x);
+        s[p] = b; s[p+1] = g; s[p+2] = r; s[p+3] = 0;
+    }
+}
+
+/* 填充圆 */
+static void fill_circle(int cx, int cy, int rad, int r, int g, int b) {
+    if (rad <= 0) { set_pixel(cx, cy, r, g, b); return; }
+    int r2 = rad * rad;
+    for (int y = cy - rad; y <= cy + rad; y++) {
+        if ((unsigned)y >= SCREEN_H) continue;
+        for (int x = cx - rad; x <= cx + rad; x++) {
+            if ((unsigned)x >= SCREEN_W) continue;
+            int dx = x - cx, dy = y - cy;
+            if (dx*dx + dy*dy <= r2)
+                set_pixel(x, y, r, g, b);
+        }
+    }
+}
+
+/* 圆环 (空心, 指定厚度) */
+static void circle_ring(int cx, int cy, int rad, int thick, int r, int g, int b) {
+    if (rad <= 0 || thick <= 0) return;
+    int outer = rad * rad;
+    int inner = (rad - thick) * (rad - thick);
+    if (inner < 0) inner = 0;
+    for (int y = cy - rad; y <= cy + rad; y++) {
+        if ((unsigned)y >= SCREEN_H) continue;
+        for (int x = cx - rad; x <= cx + rad; x++) {
+            if ((unsigned)x >= SCREEN_W) continue;
+            int dx = x - cx, dy = y - cy;
+            int d2 = dx*dx + dy*dy;
+            if (d2 <= outer && d2 >= inner)
+                set_pixel(x, y, r, g, b);
+        }
+    }
+}
+
+/*
+ * 圆角矩形填充
+ * 先填十字区域 (快速), 再逐像素填充四个圆角
+ */
+static void fill_rrect(int x1, int y1, int x2, int y2, int rad, int r, int g, int b) {
+    int w = x2 - x1, h = y2 - y1;
+    if (w <= 0 || h <= 0) return;
+    if (rad > w/2) rad = w/2;
+    if (rad > h/2) rad = h/2;
+    if (rad < 0) rad = 0;
+
+    /* 十字填充: 中间行 + 中间列 */
+    fill_rect(x1, y1 + rad, x2, y2 - rad, r, g, b);
+    fill_rect(x1 + rad, y1, x2 - rad, y2, r, g, b);
+
+    if (rad == 0) return;
+
+    int r2 = rad * rad;
+
+    /* 四个圆角 */
+    for (int y = y1; y < y1 + rad; y++) {
+        for (int x = x1; x < x1 + rad; x++) {
+            int dx = (x1 + rad) - x;
+            int dy = (y1 + rad) - y;
+            if (dx*dx + dy*dy <= r2)
+                set_pixel(x, y, r, g, b);
+        }
+    }
+    for (int y = y1; y < y1 + rad; y++) {
+        for (int x = x2 - rad; x < x2; x++) {
+            int dx = x - (x2 - rad);
+            int dy = (y1 + rad) - y;
+            if (dx*dx + dy*dy <= r2)
+                set_pixel(x, y, r, g, b);
+        }
+    }
+    for (int y = y2 - rad; y < y2; y++) {
+        for (int x = x1; x < x1 + rad; x++) {
+            int dx = (x1 + rad) - x;
+            int dy = y - (y2 - rad);
+            if (dx*dx + dy*dy <= r2)
+                set_pixel(x, y, r, g, b);
+        }
+    }
+    for (int y = y2 - rad; y < y2; y++) {
+        for (int x = x2 - rad; x < x2; x++) {
+            int dx = x - (x2 - rad);
+            int dy = y - (y2 - rad);
+            if (dx*dx + dy*dy <= r2)
+                set_pixel(x, y, r, g, b);
+        }
+    }
+}
+
+/* 垂直渐变 (纯整数运算) */
+static void gradient_v(int x1, int y1, int x2, int y2,
+                       int r1, int g1, int b1, int r2, int g2, int b2) {
+    int h = y2 - y1;
+    if (h <= 0) return;
+    char *s = DRM.vaddr;
+    if (!s) return;
+    for (int y = y1; y < y2; y++) {
+        if ((unsigned)y >= SCREEN_H) continue;
+        int t = (y - y1) * 256 / h;          /* 0..255 */
+        int r = r1 + (r2 - r1) * t / 256;
+        int g = g1 + (g2 - g1) * t / 256;
+        int b = b1 + (b2 - b1) * t / 256;
+        for (int x = x1; x < x2; x++) {
+            if ((unsigned)x >= SCREEN_W) continue;
+            int p = 4 * (SCREEN_W * y + x);
+            s[p] = b; s[p+1] = g; s[p+2] = r; s[p+3] = 0;
+        }
+    }
+}
+
+/*
+ * 向右三角形 (▶)
+ * x,y      = 左上角
+ * h        = 高度
+ * w        = 宽度
+ * 左边是底 (满高), 右边是尖端 (零高)
+ */
+static void triangle_right(int x, int y, int h, int w, int r, int g, int b) {
+    if (w <= 0 || h <= 0) return;
+    int cy = y + h / 2;
+    for (int px = x; px < x + w; px++) {
+        int remain = x + w - 1 - px;     /* w-1 .. 0 */
+        int dy = remain * (h / 2) / w;   /* h/2 .. 0 */
+        if (dy < 0) dy = 0;
+        for (int py = cy - dy; py <= cy + dy; py++)
+            set_pixel(px, py, r, g, b);
+    }
+}
+
+/* ================================================================
+ *  文字渲染函数
+ *  纯软件点阵渲染, 无外部字体库依赖
+ * ================================================================ */
+
+/*
+ * 绘制单个 ASCII 字符 (5x7 点阵, 支持任意整数缩放)
+ * x,y = 左上角
+ */
+static void draw_ascii_char(int x, int y, char ch, int r, int g, int b, int scale) {
+    if (scale < 1) scale = 1;
+    if (ch < 32 || ch > 126) return;
+    const uint8_t *glyph = font5x7[(int)(ch - 32)];
+    for (int row = 0; row < 7; row++) {
+        uint8_t bits = glyph[row];
+        for (int col = 0; col < 5; col++) {
+            if (bits & (0x10 >> col)) {
+                for (int sy = 0; sy < scale; sy++) {
+                    for (int sx = 0; sx < scale; sx++) {
+                        set_pixel(x + col * scale + sx,
+                                  y + row * scale + sy,
+                                  r, g, b);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/*
+ * 绘制 ASCII 字符串
+ */
+static void draw_text(int x, int y, const char *str, int r, int g, int b, int scale) {
+    if (!str || scale < 1) return;
+    int cx = x;
+    for (const char *p = str; *p; p++) {
+        draw_ascii_char(cx, y, *p, r, g, b, scale);
+        cx += 6 * scale;  /* 5px 字宽 + 1px 间距 */
+    }
+}
+
+/*
+ * 计算 ASCII 字符串渲染宽度
+ */
+static int text_width_ascii(const char *str, int scale) {
+    if (!str) return 0;
+    int len = 0;
+    for (const char *p = str; *p; p++) len++;
+    return len * 6 * scale;
+}
+
+/*
+ * 绘制中文 16x16 点阵汉字
+ * idx = cn_font16 索引 (0-15)
+ */
+static void draw_cn(int x, int y, int idx, int r, int g, int b, int scale) {
+    if (scale < 1) scale = 1;
+    if ((unsigned)idx >= 16) return;
+    const uint16_t *glyph = cn_font16[idx];
+    for (int row = 0; row < 16; row++) {
+        uint16_t bits = glyph[row];
+        for (int col = 0; col < 16; col++) {
+            if (bits & (0x8000 >> col)) {
+                for (int sy = 0; sy < scale; sy++) {
+                    for (int sx = 0; sx < scale; sx++) {
+                        set_pixel(x + col * scale + sx,
+                                  y + row * scale + sy,
+                                  r, g, b);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/*
+ * 计算中文渲染宽度
+ */
+static int text_width_cn(int count, int scale) {
+    return count * 16 * scale;
+}
+
+/* ================================================================
+ *  图标绘制 (全部由基础图元组合而成, 无外部资源依赖)
+ * ================================================================ */
+
+/* 麦克风图标 */
+static void icon_mic(int cx, int cy, int r, int g, int b) {
+    /* 胶囊机身 */
+    fill_rrect(cx - 13, cy - 28, cx + 13, cy + 8, 13, r, g, b);
+    /* 弧形支架 (仅绘制下半圆环, 避免覆盖问题) */
+    {
+        int acx = cx, acy = cy + 8, ar = 20, at = 3;
+        int outer = ar * ar;
+        int inner = (ar - at) * (ar - at);
+        if (inner < 0) inner = 0;
+        for (int y = acy; y <= acy + ar; y++) {
+            for (int x = acx - ar; x <= acx + ar; x++) {
+                int dx = x - acx, dy = y - acy;
+                int d2 = dx*dx + dy*dy;
+                if (d2 <= outer && d2 >= inner)
+                    set_pixel(x, y, r, g, b);
+            }
+        }
+    }
+    /* 竖向支架 */
+    vline(cx, cy + 8, cy + 28, r, g, b);
+    vline(cx + 1, cy + 8, cy + 28, r, g, b);
+    /* 底座 */
+    hline(cx - 14, cx + 15, cy + 28, r, g, b);
+    hline(cx - 14, cx + 15, cy + 29, r, g, b);
+    /* 机身横纹 (装饰) */
+    hline(cx - 9, cx + 9, cy - 18, r, g, b);
+    hline(cx - 9, cx + 9, cy - 12, r, g, b);
+    hline(cx - 9, cx + 9, cy - 6, r, g, b);
+}
+
+/* 发送箭头图标 */
+static void icon_send(int cx, int cy, int r, int g, int b) {
+    /* 箭杆 (水平粗线) */
+    fill_rect(cx - 32, cy - 3, cx - 5, cy + 3, r, g, b);
+    /* 箭头 (右指三角) */
+    triangle_right(cx - 10, cy - 16, 32, 26, r, g, b);
+}
+
+/* 首页图标 (房子) */
+static void icon_home(int cx, int cy, int r, int g, int b) {
+    /* 屋顶 (上三角) */
+    int w = 28, h = 16;
+    for (int py = 0; py < h; py++) {
+        int half = py * (w / 2) / h + 1;
+        hline(cx - half, cx + half, cy - h + py, r, g, b);
+    }
+    /* 房体 */
+    fill_rect(cx - 10, cy, cx + 10, cy + 14, r, g, b);
+    /* 门 (用底色挖出) */
+    fill_rect(cx - 3, cy + 6, cx + 3, cy + 14, 16, 18, 30);
+}
+
+/* 齿轮/设置图标 (简化: 圆环 + 中心点 + 6 齿) */
+static void icon_gear(int cx, int cy, int r, int g, int b) {
+    circle_ring(cx, cy, 13, 3, r, g, b);
+    fill_circle(cx, cy, 3, r, g, b);
+    /* 6 个齿尖 (小方块) */
+    int dx4[] = {0, 12, 12, 0, -12, -12};
+    int dy4[] = {-14, -7, 7, 14, 7, -7};
+    for (int i = 0; i < 6; i++)
+        fill_rect(cx + dx4[i] - 2, cy + dy4[i] - 2,
+                  cx + dx4[i] + 2, cy + dy4[i] + 2, r, g, b);
+}
+
+/* ================================================================
+ *  UI 渲染
+ *  state:   0=就绪  1=录音中  2=发送中  3=成功  4=错误
+ *  pressed: -1=无  0=录音键按下  1=发送键按下
+ * ================================================================ */
+static void redraw_ui(int state, int pressed) {
+    pthread_mutex_lock(&ui_lock);
+
+    /* 背景: 深色垂直渐变 */
+    gradient_v(0, 0, SCREEN_W, SCREEN_H, 10, 10, 18, 24, 24, 42);
+
+    /* 顶栏 */
+    draw_topbar();
+
+    /* 主区域: 两张卡片 */
+    draw_cards(pressed);
+
+    /* 状态栏 */
+    draw_statusbar(state);
+
+    /* 底部导航栏 */
+    draw_navbar();
+
+    /* 刷新 LCD */
+    DRMshowUp(lcd_fb, &DRM);
+
+    pthread_mutex_unlock(&ui_lock);
+}
+
+/* ---- 顶栏 ---- */
+static void draw_topbar(void) {
+    /* 背景 */
+    fill_rect(0, 0, SCREEN_W, 70, 16, 18, 30);
+
+    /* 左侧标题装饰: 绿色圆点 + 两条线 */
+    fill_circle(36, 35, 9, 46, 204, 113);        /* AI 状态指示灯 */
+    circle_ring(36, 35, 13, 2, 46, 204, 113);     /* 外环光晕 */
+
+    /* 标题文字: "语音助手" (中文 16x16, scale=1, 共4字=64px宽) */
+    /* 居中 y=19 -> 19+16=35 居中于顶栏 */
+    draw_cn(64, 19, CN_YU,   200, 210, 225, 1);
+    draw_cn(80, 19, CN_YIN,  200, 210, 225, 1);
+    draw_cn(96, 19, CN_ZHU,  150, 160, 175, 1);
+    draw_cn(112,19, CN_SHOU, 150, 160, 175, 1);
+
+    /* 标题装饰线 (移到标题右侧) */
+    hline(135, 280, 32, 120, 130, 160);           /* 标题线 1 */
+    hline(135, 240, 38, 80, 90, 115);             /* 标题线 2 (短, 暗色) */
+
+    /* 中间装饰: 三个小圆点 */
+    for (int i = 0; i < 3; i++)
+        fill_circle(490 + i * 16, 35, 3, 60, 65, 85);
+
+    /* 右侧状态图标: 三个小圆 (信号/WiFi/电量) */
+    fill_circle(940, 35, 6, 160, 165, 185);
+    circle_ring(964, 35, 7, 2, 160, 165, 185);
+    fill_rect(986, 29, 998, 41, 160, 165, 185);   /* 电池外框 */
+    fill_rect(998, 32, 1002, 38, 160, 165, 185);  /* 电池头 */
+    fill_rect(988, 31, 996, 39, 46, 204, 113);    /* 电池电量 (绿) */
+
+    /* 分隔线 */
+    hline(0, SCREEN_W, 70, 40, 44, 66);
+    hline(0, SCREEN_W, 71, 40, 44, 66);
+}
+
+/* ---- 主区域: 两张大圆角卡片 ---- */
+static void draw_cards(int pressed) {
+    /* ========================================
+     *  录音卡片 (左)
+     * ======================================== */
+    int rec_bg_r, rec_bg_g, rec_bg_b;
+    int rec_bdr_r, rec_bdr_g, rec_bdr_b;
+    int rec_ico_r, rec_ico_g, rec_ico_b;
+
+    if (pressed == 0) {
+        rec_bg_r = 45;  rec_bg_g = 52;  rec_bg_b = 85;
+        rec_bdr_r = 110; rec_bdr_g = 130; rec_bdr_b = 175;
+        rec_ico_r = 255; rec_ico_g = 255; rec_ico_b = 255;
+    } else {
+        rec_bg_r = 28;  rec_bg_g = 30;  rec_bg_b = 48;
+        rec_bdr_r = 58; rec_bdr_g = 64; rec_bdr_b = 98;
+        rec_ico_r = 231; rec_ico_g = 76; rec_ico_b = 60;
+    }
+
+    /* 卡片边框 (2px) */
+    fill_rrect(BTN_RECORD.x1, BTN_RECORD.y1,
+               BTN_RECORD.x2, BTN_RECORD.y2, 25,
+               rec_bdr_r, rec_bdr_g, rec_bdr_b);
+    /* 卡片填充 (内缩 2px) */
+    fill_rrect(BTN_RECORD.x1 + 2, BTN_RECORD.y1 + 2,
+               BTN_RECORD.x2 - 2, BTN_RECORD.y2 - 2, 23,
+               rec_bg_r, rec_bg_g, rec_bg_b);
+
+    /* 图标光晕 (大圆, 暗色) */
+    fill_circle(282, 250, 55, 50, 20, 24);
+    /* 麦克风图标 */
+    icon_mic(282, 250, rec_ico_r, rec_ico_g, rec_ico_b);
+
+    /* 底部强调条 (圆角矩形) */
+    fill_rrect(BTN_RECORD.x1 + 40, BTN_RECORD.y2 - 26,
+               BTN_RECORD.x2 - 40, BTN_RECORD.y2 - 14, 6,
+               231, 76, 60);
+
+    /* 卡片文字: "录音" (中文 16x16, scale=2 → 32x32每字, 2字=64px宽) */
+    {
+        int tx = 282 - 32;  /* 居中: 282 - 64/2 */
+        int ty = BTN_RECORD.y2 - 62;  /* 强调条上方 */
+        draw_cn(tx, ty, CN_LU,  190, 195, 215, 2);
+        draw_cn(tx + 32, ty, CN_YIN, 190, 195, 215, 2);
+    }
+
+    /* ========================================
+     *  发送卡片 (右)
+     * ======================================== */
+    int snd_bg_r, snd_bg_g, snd_bg_b;
+    int snd_bdr_r, snd_bdr_g, snd_bdr_b;
+    int snd_ico_r, snd_ico_g, snd_ico_b;
+
+    if (pressed == 1) {
+        snd_bg_r = 45;  snd_bg_g = 52;  snd_bg_b = 85;
+        snd_bdr_r = 110; snd_bdr_g = 130; snd_bdr_b = 175;
+        snd_ico_r = 255; snd_ico_g = 255; snd_ico_b = 255;
+    } else {
+        snd_bg_r = 28;  snd_bg_g = 30;  snd_bg_b = 48;
+        snd_bdr_r = 58; snd_bdr_g = 64; snd_bdr_b = 98;
+        snd_ico_r = 46; snd_ico_g = 204; snd_ico_b = 113;
+    }
+
+    /* 卡片边框 */
+    fill_rrect(BTN_SEND.x1, BTN_SEND.y1,
+               BTN_SEND.x2, BTN_SEND.y2, 25,
+               snd_bdr_r, snd_bdr_g, snd_bdr_b);
+    /* 卡片填充 */
+    fill_rrect(BTN_SEND.x1 + 2, BTN_SEND.y1 + 2,
+               BTN_SEND.x2 - 2, BTN_SEND.y2 - 2, 23,
+               snd_bg_r, snd_bg_g, snd_bg_b);
+
+    /* 图标光晕 */
+    fill_circle(742, 250, 55, 15, 55, 30);
+    /* 发送图标 */
+    icon_send(742, 250, snd_ico_r, snd_ico_g, snd_ico_b);
+
+    /* 底部强调条 */
+    fill_rrect(BTN_SEND.x1 + 40, BTN_SEND.y2 - 26,
+               BTN_SEND.x2 - 40, BTN_SEND.y2 - 14, 6,
+               46, 204, 113);
+
+    /* 卡片文字: "发送" (中文 16x16, scale=2) */
+    {
+        int tx = 742 - 32;
+        int ty = BTN_SEND.y2 - 62;
+        draw_cn(tx, ty, CN_FA,   190, 195, 215, 2);
+        draw_cn(tx + 32, ty, CN_SONG, 190, 195, 215, 2);
+    }
+}
+
+/* ---- 状态栏 ---- */
+static void draw_statusbar(int state) {
+    int r, g, b;
+    const char *label;
+    int cn_idx1 = -1, cn_idx2 = -1, cn_idx3 = -1;
+
+    switch (state) {
+        case 1:
+            r = 231; g = 76;  b = 60;
+            label = "RECORDING";
+            cn_idx1 = CN_LU; cn_idx2 = CN_YIN; cn_idx3 = CN_ZHONG;
+            break;   /* 录音中: 红 */
+        case 2:
+            r = 211; g = 137; b = 42;
+            label = "SENDING";
+            cn_idx1 = CN_FA; cn_idx2 = CN_SONG; cn_idx3 = CN_ZHONG;
+            break;   /* 发送中: 橙 */
+        case 3:
+            r = 46;  g = 204; b = 113;
+            label = "SUCCESS";
+            break;   /* 成功:   绿 */
+        case 4:
+            r = 192; g = 57;  b = 43;
+            label = "ERROR";
+            cn_idx1 = CN_CUO; cn_idx2 = CN_WU;
+            break;   /* 错误:   暗红 */
+        default:
+            r = 90;  g = 110; b = 145;
+            label = "READY";
+            cn_idx1 = CN_JIU; cn_idx2 = CN_XU;
+            break;   /* 就绪:   蓝灰 */
+    }
+
+    /* 分隔线 */
+    hline(0, SCREEN_W, 460, 40, 44, 66);
+    hline(0, SCREEN_W, 461, 40, 44, 66);
+
+    /* 状态栏背景 */
+    fill_rect(0, 462, SCREEN_W, 520, r, g, b);
+
+    /* 状态指示灯 (白色圆点 + 外环) */
+    fill_circle(55, 491, 12, 255, 255, 255);
+    circle_ring(55, 491, 16, 2, 255, 255, 255);
+
+    /* 中文状态文字 (16x16, scale=1, 在指示灯右侧) */
+    if (cn_idx1 >= 0) {
+        int tx = 90, ty = 483;
+        draw_cn(tx, ty, cn_idx1, 255, 255, 255, 1);
+        if (cn_idx2 >= 0) {
+            draw_cn(tx + 16, ty, cn_idx2, 255, 255, 255, 1);
+            if (cn_idx3 >= 0)
+                draw_cn(tx + 32, ty, cn_idx3, 255, 255, 255, 1);
+        }
+    }
+
+    /* 英语状态文字 (5x7, scale=1, 在中文右侧) */
+    {
+        int tx = 155;
+        if (cn_idx3 >= 0) tx = 155;
+        else if (cn_idx2 >= 0) tx = 139;
+        else if (cn_idx1 >= 0) tx = 123;
+        draw_text(tx, 488, label, 255, 255, 255, 1);
+    }
+
+    /* 装饰: 5 个小点 (进度指示风格) */
+    for (int i = 0; i < 5; i++) {
+        int dot_r = (i < state) ? 255 : 180;
+        int dot_g = (i < state) ? 255 : 180;
+        int dot_b = (i < state) ? 255 : 180;
+        fill_circle(350 + i * 24, 491, 4, dot_r, dot_g, dot_b);
+    }
+
+    /* 右侧装饰线 */
+    hline(800, 980, 489, 255, 255, 255);
+    hline(820, 960, 493, 200, 200, 200);
+}
+
+/* ---- 底部导航栏 ---- */
+static void draw_navbar(void) {
+    /* 分隔线 */
+    hline(0, SCREEN_W, 520, 40, 44, 66);
+    hline(0, SCREEN_W, 521, 40, 44, 66);
+
+    /* 背景 */
+    fill_rect(0, 522, SCREEN_W, SCREEN_H, 16, 18, 30);
+
+    /* 左: 首页图标 */
+    icon_home(200, 556, 110, 120, 145);
+    /* 首页标签 */
+    draw_cn(184, 576, CN_SHOU2, 110, 120, 145, 1);
+    draw_cn(200, 576, CN_YE,    110, 120, 145, 1);
+
+    /* 中: 当前页指示 (高亮圆) */
+    fill_circle(512, 558, 20, 40, 50, 80);
+    circle_ring(512, 558, 22, 2, 46, 204, 113);
+    fill_circle(512, 558, 6, 46, 204, 113);
+
+    /* 右: 设置图标 */
+    icon_gear(824, 556, 110, 120, 145);
+    /* 设置标签 */
+    draw_cn(808, 576, CN_SHE, 110, 120, 145, 1);
+    draw_cn(824, 576, CN_ZHI, 110, 120, 145, 1);
+
+    /* 底部 Home 指示条 (类似手机底部条) */
+    fill_rrect(462, 590, 562, 596, 3, 60, 65, 85);
+}
+
+/* ================================================================
+ *  后台控制监听线程
+ *  接收 AI 回复文本并触发语音播放与硬件动作
+ * ================================================================ */
+static void *listener_thread(void *arg) {
+    const char *wsl_ip = (const char *)arg;
+
+    int server_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (server_fd < 0) {
+        perror("[Listener] socket");
+        return NULL;
+    }
+
+    int opt = 1;
+    setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = INADDR_ANY;
+    addr.sin_port = htons(CONTROL_PORT);
+
+    if (bind(server_fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+        perror("[Listener] bind");
+        close(server_fd);
+        return NULL;
+    }
+    if (listen(server_fd, 3) < 0) {
+        perror("[Listener] listen");
+        close(server_fd);
+        return NULL;
+    }
+
+    printf("[Listener] Listening on port %d...\n", CONTROL_PORT);
+
+    while (1) {
+        struct sockaddr_in caddr;
+        socklen_t clen = sizeof(caddr);
+        int csock = accept(server_fd, (struct sockaddr*)&caddr, &clen);
+        if (csock < 0) continue;
+
+        char buf[1024] = {0};
+        int len = recv(csock, buf, sizeof(buf) - 1, 0);
+        if (len > 0) {
+            buf[len] = '\0';
+            printf("\n==============================================\n");
+            printf(" [AI Reply]: %s\n", buf);
+            printf("==============================================\n\n");
+
+            /* 播放语音回复 */
+            printf("[Hardware] Playing AI voice reply...\n");
+            system("aplay -D plughw:1,0 /root/code/reply.wav &");
+
+            /* 硬件动作 */
+            if (strstr(buf, "打开LED灯") != NULL || strstr(buf, "开灯") != NULL) {
+                printf("[Hardware] --> LED ON!\n");
+                send(csock, "LED ON SUCCESS", 14, 0);
+                redraw_ui(3, -1);   /* 成功 (绿) */
+                sleep(3);
+                redraw_ui(0, -1);   /* 恢复就绪 */
+            } else if (strstr(buf, "关闭LED灯") != NULL || strstr(buf, "关灯") != NULL) {
+                printf("[Hardware] --> LED OFF!\n");
+                send(csock, "LED OFF SUCCESS", 15, 0);
+                /* 关灯: 黑屏 3 秒 */
+                pthread_mutex_lock(&ui_lock);
+                clear_screen(0, 0, 0);
+                DRMshowUp(lcd_fb, &DRM);
+                pthread_mutex_unlock(&ui_lock);
+                sleep(3);
+                redraw_ui(0, -1);
+            } else {
+                send(csock, "COMMAND RECEIVED", 16, 0);
+                redraw_ui(3, -1);   /* 成功 (绿) */
+                sleep(3);
+                redraw_ui(0, -1);
+            }
+        }
+        close(csock);
+    }
+
+    close(server_fd);
+    return NULL;
+}
+
+/* ================================================================
+ *  主函数
+ * ================================================================ */
+int main(int argc, char *argv[]) {
+    const char *wsl_ip = "10.200.67.238";
+    if (argc >= 2) wsl_ip = argv[1];
+
+    printf("====================================================\n");
+    printf(" RK1808 AI Assistant — Car-Style Touch UI\n");
+    printf(" Target WSL Server: %s\n", wsl_ip);
+    printf(" Screen: %dx%d  Touch: %s\n", SCREEN_W, SCREEN_H, TOUCH_DEVICE);
+    printf("====================================================\n");
+
+    /* 1. 初始化 DRM LCD */
+    lcd_fb = DRM_LCD_DEV_Init();
+    if (lcd_fb < 0) {
+        printf("[DRM] LCD init failed. Exit.\n");
+        return -1;
+    }
+    printf("[DRM] LCD OK. Resolution: %dx%d\n", DRM.width, DRM.height);
+
+    /* 2. 打开触屏设备 */
+    touch_fd = open(TOUCH_DEVICE, O_RDONLY);
+    if (touch_fd < 0) {
+        perror("[Touch] open");
+        DRM_LCD_DEV_Del(lcd_fb);
+        return -1;
+    }
+
+    /* 3. 读取触屏量程并初始化坐标缩放 */
+    init_touch_scaling();
+
+    /* 4. 渲染初始界面 */
+    redraw_ui(0, -1);       /* 就绪状态 */
+
+    /* 5. 启动控制监听线程 */
+    pthread_t tid;
+    if (pthread_create(&tid, NULL, listener_thread, (void *)wsl_ip) != 0) {
+        perror("[Thread] create listener");
+        close(touch_fd);
+        DRM_LCD_DEV_Del(lcd_fb);
+        return -1;
+    }
+    pthread_detach(tid);
+
+    /* 6. 主循环: 触屏事件处理 */
+    struct input_event ts;
+    int touch_x = -1, touch_y = -1;
+    int pressed_btn = -1;       /* 当前按下的按钮: -1=无, 0=录音, 1=发送 */
+
+    printf("[Main] Touch loop started. Waiting for input...\n");
+
+    while (1) {
+        if (read(touch_fd, &ts, sizeof(ts)) != sizeof(ts))
+            continue;
+
+        /* 更新触摸坐标 (带缩放) */
+        if (ts.type == EV_ABS && ts.code == ABS_X)
+            touch_x = scale_x(ts.value);
+        if (ts.type == EV_ABS && ts.code == ABS_Y)
+            touch_y = scale_y(ts.value);
+
+        /* ---- 触摸按下 (BTN_TOUCH=1) ---- */
+        if (ts.type == EV_KEY && ts.code == BTN_TOUCH && ts.value == 1) {
+            if (touch_x >= 0 && touch_y >= 0) {
+                /* 判断按下了哪个按钮, 显示按压反馈 */
+                if (touch_x >= BTN_RECORD.x1 && touch_x < BTN_RECORD.x2 &&
+                    touch_y >= BTN_RECORD.y1 && touch_y < BTN_RECORD.y2) {
+                    pressed_btn = 0;
+                    redraw_ui(0, 0);        /* 录音键高亮 */
+                } else if (touch_x >= BTN_SEND.x1 && touch_x < BTN_SEND.x2 &&
+                           touch_y >= BTN_SEND.y1 && touch_y < BTN_SEND.y2) {
+                    pressed_btn = 1;
+                    redraw_ui(0, 1);        /* 发送键高亮 */
+                }
+            }
+        }
+
+        /* ---- 触摸抬起 (BTN_TOUCH=0) ---- */
+        if (ts.type == EV_KEY && ts.code == BTN_TOUCH && ts.value == 0) {
+            if (touch_x >= 0 && touch_y >= 0) {
+                printf("[Touch] Release at (%d, %d)\n", touch_x, touch_y);
+
+                /* 录音键: 按下与抬起在同一区域才触发 */
+                if (pressed_btn == 0 &&
+                    touch_x >= BTN_RECORD.x1 && touch_x < BTN_RECORD.x2 &&
+                    touch_y >= BTN_RECORD.y1 && touch_y < BTN_RECORD.y2) {
+
+                    printf("[Action] RECORD button tapped!\n");
+                    redraw_ui(1, -1);       /* 录音中 (红) */
+
+                    printf("[Record] Capturing 3s audio...\n");
+                    system("arecord -D plughw:1,0 -d 3 -c 1 -r 16000 -t wav -f S16_LE cmd.wav");
+                    printf("[Record] Done.\n");
+
+                    redraw_ui(0, -1);       /* 恢复就绪 */
+
+                /* 发送键 */
+                } else if (pressed_btn == 1 &&
+                           touch_x >= BTN_SEND.x1 && touch_x < BTN_SEND.x2 &&
+                           touch_y >= BTN_SEND.y1 && touch_y < BTN_SEND.y2) {
+
+                    printf("[Action] SEND button tapped!\n");
+                    redraw_ui(2, -1);       /* 发送中 (橙) */
+
+                    printf("[Send] SCP transfer...\n");
+                    char scp_cmd[512];
+                    snprintf(scp_cmd, sizeof(scp_cmd),
+                             "scp -o StrictHostKeyChecking=no cmd.wav cyj@%s:/home/cyj/workspace/ai_assistant/bin/wav/cmd.wav",
+                             wsl_ip);
+                    system(scp_cmd);
+                    printf("[Send] SCP done. Waiting for AI response...\n");
+                    /* 保持发送中状态, 等待 listener_thread 收到 AI 回复后更新 */
+
+                } else {
+                    /* 点击空白区域: 恢复就绪 */
+                    redraw_ui(0, -1);
+                }
+            }
+            pressed_btn = -1;
+            touch_x = -1;
+            touch_y = -1;
+        }
+    }
+
+    /* 清理 (理论上不会到达) */
+    close(touch_fd);
+    DRM_LCD_DEV_Del(lcd_fb);
+    return 0;
+}

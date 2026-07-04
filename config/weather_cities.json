@@ -1,0 +1,6 @@
+﻿{
+  "cities": [
+    { "key": "Wuhan", "name": "武汉", "latitude": 30.5928, "longitude": 114.3055 },
+    { "key": "Guangzhou", "name": "广州", "latitude": 23.1291, "longitude": 113.2644 }
+  ]
+}

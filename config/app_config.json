@@ -1,0 +1,18 @@
+{
+  "wsl_server_ip": "10.203.129.104",
+  "wsl_username": "cyj",
+  "board_ip": "10.203.129.238",
+  "touch_device": "/dev/input/event2",
+  "drm_device": "/dev/dri/card0",
+  "image_dir": "/root/picture",
+  "file_browser_root": "/",
+  "local_voice_cmd_wav": "/tmp/rec.wav",
+  "local_voice_reply_wav": "/tmp/reply.wav",
+  "wsl_voice_cmd_wav": "/home/cyj/workspace/ai_assistant/bin/wav/cmd.wav",
+  "wsl_ai_pipeline": "/home/cyj/workspace/ai_assistant/scripts/ai_pipeline.py",
+  "wsl_get_weather": "/home/cyj/workspace/ai_assistant/scripts/get_weather.py",
+  "wifi_password_file": "config/wifi_passwords.conf",
+  "font_path": "assets/simsun.ttc"
+}
+
+

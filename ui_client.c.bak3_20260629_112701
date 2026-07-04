@@ -1,0 +1,910 @@
+/*
+ * ui_client.c — AI Assistant Multi-Page Touch UI (RK1808/GEC6818)
+ * ================================================================
+ * Screen:   1024x600 DRM Framebuffer (BGRA)
+ * Touch:    /dev/input/event2
+ * Pages:    Home / Voice / Smart Home / Images / Settings / BMP View
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <arpa/inet.h>
+#include <errno.h>
+#include <stdint.h>
+#include <pthread.h>
+#include <fcntl.h>
+#include <sys/ioctl.h>
+#include <sys/mman.h>
+#include <linux/input.h>
+#include <dirent.h>
+#include <math.h>
+#include "./DRMwrap.h"
+
+#include "./inc/display.h"
+#include "./inc/font_display.h"
+
+/* stb_truetype embedded font renderer */
+extern int font_init(const char *font_path);
+extern void font_done(void);
+extern void DRM_Draw_Text(int lcd_fd, struct drmHandle *drm,
+                          const char *text, int font_size,
+                          uint32_t color, int x, int y);
+
+/* ===== Forward Declarations ===== */
+static void scan_bmp_dir();
+static void wifi_scan();
+static void render_page();
+static void* record_thread_func(void* arg);
+static void* send_thread_func(void* arg);
+static void* wifi_scan_thread_func(void* arg);
+static void* weather_thread_func(void* arg);
+static void* listener_thread(void* arg);
+static void* wav_listener_thread(void* arg);
+
+
+#define SCREEN_W      1024
+#define SCREEN_H      600
+#define CONTROL_PORT  8888
+#define WAV_DATA_PORT 8889
+#define TOUCH_DEVICE  "/dev/input/event2"
+#define DRM_DEVICE    "/dev/dri/card0"
+#define BMP_DIR       "/root/picture"
+
+#define PAGE_HOME      0
+#define PAGE_VOICE     1
+#define PAGE_SMART     2
+#define PAGE_IMAGES    3
+#define PAGE_SETTINGS  4
+#define PAGE_BMPVIEW   5
+#define PAGE_FILES     6
+
+#define DEV_LIGHT   0
+#define DEV_FAN     1
+#define DEV_CURTAIN 2
+#define DEV_LOCK    3
+#define DEV_SWITCH  4
+#define DEV_TEMP    5
+
+#define MAX_WIFI    20
+#define MAX_BMP     100
+#define MAX_CHAT    20
+
+
+typedef struct { int x1, y1, x2, y2; } rect_t;
+
+/* ===== Touch Hit Regions ===== */
+/* Home page buttons */
+static rect_t home_voice_btn  = {80, 180, 480, 340};
+static rect_t home_smart_btn  = {510, 180, 910, 340};
+static rect_t home_images_btn = {80, 370, 480, 530};
+static rect_t home_files_btn  = {180, 356, 612, 566};
+static rect_t home_sett_btn   = {628, 356, 1000, 566};
+
+/* Voice page (match drawn layout) */
+static rect_t voice_mic_btn   = {520, 336, 620, 436};
+static rect_t voice_send_btn  = {910, 476, 1000, 520};
+
+/* Smart Home devices */
+static rect_t smart_btns[6] = {
+    {40, 110, 330, 260}, {360, 110, 650, 260}, {680, 110, 970, 260},
+    {40, 290, 330, 440}, {360, 290, 650, 440}, {680, 290, 970, 440}
+};
+
+/* Images page */
+static rect_t img_up_btn   = {964, 55, 1004, 95};
+static rect_t img_down_btn = {964, 105, 1004, 145};
+static rect_t img_thumbs[6] = {
+    {30, 100, 330, 300}, {350, 100, 650, 300}, {670, 100, 970, 300},
+    {30, 320, 330, 520}, {350, 320, 650, 520}, {670, 320, 970, 520}
+};
+
+/* BMP View */
+static rect_t bmp_prev_btn = {30, 520, 120, 558};
+static rect_t bmp_next_btn = {874, 520, 974, 558};
+
+/* Settings */
+static rect_t sett_scan_btn  = {864, 102, 994, 148};
+static rect_t sett_wifi_btns[6] = {
+    {854, 175, 964, 205}, {854, 225, 964, 255}, {854, 275, 964, 305},
+    {854, 325, 964, 355}, {854, 375, 964, 405}, {854, 425, 964, 455}
+};
+
+/* Back button (universal, top-right) */
+static rect_t back_btn = {924, 7, 1004, 43};
+
+
+/* ===== Globals ===== */
+struct drmHandle DRM;
+int lcd_fb = -1;
+int touch_fd = -1;
+pthread_mutex_t ui_lock = PTHREAD_MUTEX_INITIALIZER;
+static int ts_min_x = 0, ts_max_x = 1023;
+static int ts_min_y = 0, ts_max_y = 599;
+static int cur_page = PAGE_HOME;
+static int cur_subpage = -1;
+static int smart_dev[6] = {0, 0, 0, 0, 0, 0};
+static char bmp_files[MAX_BMP][256];
+static int bmp_count = 0;
+static int bmp_scroll = 0;
+static int bmp_index = 0;
+static char wifi_ssid[MAX_WIFI][64];
+static int wifi_signal[MAX_WIFI];
+static int wifi_count = 0;
+static int wifi_scanning = 0;
+static int rec_state = 0;
+static char chat_text[MAX_CHAT][256];
+static int chat_lines = 0;
+static char status_msg[128] = "AI ready";
+static int msg_timer = 0;
+static int ui_needs_redraw = 0;
+static char g_wsl_ip[64] = "10.200.67.238";
+static char weather_info_wuhan[128] = "获取中...";
+static char weather_info_beijing[128] = "获取中...";
+
+
+/* ===== Drawing Primitives ===== */
+static void draw_pixel(int x, int y, uint32_t color) {
+    if (x < 0 || x >= SCREEN_W || y < 0 || y >= SCREEN_H) return;
+    if (!DRM.vaddr) return;
+    uint32_t *fb = (uint32_t *)DRM.vaddr;
+    fb[y * SCREEN_W + x] = color;
+}
+
+static void draw_rect(int x1, int y1, int x2, int y2, uint32_t color) {
+    for (int y = y1; y <= y2; y++)
+        for (int x = x1; x <= x2; x++)
+            draw_pixel(x, y, color);
+}
+
+static void draw_rect_round(int x1, int y1, int x2, int y2, int r, uint32_t color) {
+    for (int y = y1; y <= y2; y++) {
+        for (int x = x1; x <= x2; x++) {
+            int in = 0;
+            if (x < x1 + r && y < y1 + r) {
+                int dx = x - (x1 + r), dy = y - (y1 + r);
+                in = (dx*dx + dy*dy <= r*r);
+            } else if (x > x2 - r && y < y1 + r) {
+                int dx = x - (x2 - r), dy = y - (y1 + r);
+                in = (dx*dx + dy*dy <= r*r);
+            } else if (x < x1 + r && y > y2 - r) {
+                int dx = x - (x1 + r), dy = y - (y2 - r);
+                in = (dx*dx + dy*dy <= r*r);
+            } else if (x > x2 - r && y > y2 - r) {
+                int dx = x - (x2 - r), dy = y - (y2 - r);
+                in = (dx*dx + dy*dy <= r*r);
+            } else { in = 1; }
+            if (in) draw_pixel(x, y, color);
+        }
+    }
+}
+
+/* Chinese characters: now rendered via stb_truetype (see draw_text) */
+
+
+static void draw_utf8_text(int x, int y, const char* str, uint32_t color, int scale) {
+    /* Use stb_truetype real font rendering.
+       Map old scale to font_size: 1->12px, 2->24px, 3->36px */
+    int font_size = scale * 14;
+    DRM_Draw_Text(lcd_fb, &DRM, str, font_size, color, x, y);
+}
+
+/* ASCII chars: now rendered via stb_truetype (see draw_text) */
+
+static void draw_text(int x, int y, const char* str, uint32_t color, int scale) {
+    draw_utf8_text(x, y, str, color, scale);
+}
+
+
+static int touch_map_x(int raw) {
+    if (ts_max_x == ts_min_x) return raw;
+    return SCREEN_W * (raw - ts_min_x) / (ts_max_x - ts_min_x);
+}
+
+static int touch_map_y(int raw) {
+    if (ts_max_y == ts_min_y) return raw;
+    return SCREEN_H * (raw - ts_min_y) / (ts_max_y - ts_min_y);
+}
+
+static int pt_in_rect(int px, int py, rect_t r) {
+    return px >= r.x1 && px <= r.x2 && py >= r.y1 && py <= r.y2;
+}
+
+/* ===== BMP Loading ===== */
+static void draw_bmp(int dx, int dy, int dw, int dh, const char* path) {
+    FILE* f = fopen(path, "rb");
+    if (!f) return;
+    uint8_t header[54];
+    if (fread(header, 1, 54, f) != 54) { fclose(f); return; }
+    int w = *(int*)(header + 18);
+    int h = *(int*)(header + 22);
+    int bpp = *(short*)(header + 28);
+    if (bpp != 24 && bpp != 32) { fclose(f); return; }
+    int row_size = ((w * (bpp/8) + 3) / 4) * 4;
+    int data_off = *(int*)(header + 10);
+    fseek(f, data_off, SEEK_SET);
+    uint8_t* row = (uint8_t*)malloc(row_size);
+    for (int y = 0; y < h && y < dh; y++) {
+        fread(row, 1, row_size, f);
+        for (int x = 0; x < w && x < dw; x++) {
+            int px = dx + x;
+            int py = dy + dh - 1 - y;
+            if (px >= 0 && px < SCREEN_W && py >= 0 && py < SCREEN_H) {
+                uint32_t color;
+                if (bpp == 24) {
+                    color = row[x*3] | (row[x*3+1] << 8) | (row[x*3+2] << 16);
+                } else {
+                    color = *(uint32_t*)(row + x*4);
+                }
+                draw_pixel(px, py, color);
+            }
+        }
+    }
+    free(row);
+    fclose(f);
+}
+
+static void scan_bmp_dir() {
+    DIR* d = opendir(BMP_DIR);
+    if (!d) return;
+    bmp_count = 0;
+    struct dirent* entry;
+    while ((entry = readdir(d)) && bmp_count < MAX_BMP) {
+        char* n = entry->d_name;
+        int len = strlen(n);
+        if (len > 4 && (strcasecmp(n + len - 4, ".bmp") == 0)) {
+            strncpy(bmp_files[bmp_count], n, 255);
+            bmp_count++;
+        }
+    }
+    closedir(d);
+}
+
+/* ===== WiFi Scan ===== */
+static void wifi_scan() {
+    wifi_count = 0;
+    wifi_scanning = 1;
+    FILE* fp = popen("iwlist wlan0 scan 2>/dev/null", "r");
+    if (!fp) { wifi_scanning = 0; return; }
+    char buf[512];
+    while (fgets(buf, sizeof(buf), fp) && wifi_count < MAX_WIFI) {
+        char* essid = strstr(buf, "ESSID:");
+        if (essid) {
+            char* start = strchr(essid, '"');
+            if (start) {
+                char* end = strchr(start + 1, '"');
+                if (end) {
+                    int len = end - start - 1;
+                    if (len > 63) len = 63;
+                    strncpy(wifi_ssid[wifi_count], start + 1, len);
+                    wifi_ssid[wifi_count][len] = 0;
+                }
+            }
+        }
+        char* qual = strstr(buf, "Signal level=");
+        if (qual && wifi_count < MAX_WIFI) {
+            wifi_signal[wifi_count] = atoi(qual + 13);
+            wifi_count++;
+        }
+    }
+    pclose(fp);
+    wifi_scanning = 0;
+}
+
+/* ===== Background Thread Implementations ===== */
+static void* record_thread_func(void* arg) {
+    pthread_mutex_lock(&ui_lock);
+    rec_state = 1;
+    snprintf(status_msg, sizeof(status_msg), "正在录音 (3秒)...");
+    ui_needs_redraw = 1;
+    pthread_mutex_unlock(&ui_lock);
+
+    // Record using card 1: rk809-codec (plughw:1,0)
+    system("arecord -D plughw:1,0 -d 3 -c 1 -r 16000 -t wav -f S16_LE /root/code/cmd.wav >/dev/null 2>&1");
+
+    pthread_mutex_lock(&ui_lock);
+    rec_state = 0;
+    snprintf(status_msg, sizeof(status_msg), "录音完毕，请发送");
+    ui_needs_redraw = 1;
+    pthread_mutex_unlock(&ui_lock);
+    return NULL;
+}
+
+static void* send_thread_func(void* arg) {
+    pthread_mutex_lock(&ui_lock);
+    snprintf(status_msg, sizeof(status_msg), "正在发送音频...");
+    ui_needs_redraw = 1;  /* main loop renders */
+    pthread_mutex_unlock(&ui_lock);
+
+    char scp_cmd[512];
+    char wsl_ip_snap[64];
+    pthread_mutex_lock(&ui_lock);
+    strncpy(wsl_ip_snap, g_wsl_ip, sizeof(wsl_ip_snap) - 1);
+    wsl_ip_snap[sizeof(wsl_ip_snap)-1] = '\0';
+    pthread_mutex_unlock(&ui_lock);
+    snprintf(scp_cmd, sizeof(scp_cmd),
+             "scp -o StrictHostKeyChecking=no -o ConnectTimeout=10 /root/code/cmd.wav cyj@%s:/home/cyj/workspace/ai_assistant/bin/wav/cmd.wav >/dev/null 2>&1",
+             wsl_ip_snap);
+    int ret = system(scp_cmd);
+
+    pthread_mutex_lock(&ui_lock);
+    if (ret == 0) {
+        snprintf(status_msg, sizeof(status_msg), "已发送，等待AI回复...");
+        if (chat_lines < MAX_CHAT) {
+            snprintf(chat_text[chat_lines], 256, "> 语音已发送");
+            chat_lines++;
+        }
+    } else {
+        snprintf(status_msg, sizeof(status_msg), "发送失败，请检查连接");
+    }
+    ui_needs_redraw = 1;
+    pthread_mutex_unlock(&ui_lock);
+    return NULL;
+}
+
+static void* wifi_scan_thread_func(void* arg) {
+    pthread_mutex_lock(&ui_lock);
+    wifi_scanning = 1;
+    snprintf(status_msg, sizeof(status_msg), "正在扫描Wi-Fi...");
+    ui_needs_redraw = 1;  /* main loop renders */
+    pthread_mutex_unlock(&ui_lock);
+
+    system("wpa_cli -p /var/run/wpa_supplicant -i wlan0 scan >/dev/null 2>&1");
+    usleep(1500000); // Wait for scan results to be populated
+
+    /* FIX: All blocking I/O (popen+fgets) runs OUTSIDE the lock.
+     * Results collected in thread-local buffers, then batch-written under lock. */
+    char local_ssid[MAX_WIFI][64];
+    int  local_signal[MAX_WIFI];
+    int  local_count = 0;
+
+    FILE* fp = popen("wpa_cli -p /var/run/wpa_supplicant -i wlan0 scan_results 2>/dev/null", "r");
+    if (fp) {
+        char buf[512];
+        /* Skip header line */
+        if (fgets(buf, sizeof(buf), fp)) {}
+
+        while (fgets(buf, sizeof(buf), fp) && local_count < MAX_WIFI) {
+            int signal = 0;
+            char ssid[128] = {0};
+
+            char* tab1 = strchr(buf, '\t'); if (!tab1) continue; *tab1 = '\0';
+            char* tab2 = strchr(tab1 + 1, '\t'); if (!tab2) continue; *tab2 = '\0';
+            char* tab3 = strchr(tab2 + 1, '\t'); if (!tab3) continue; *tab3 = '\0';
+            char* tab4 = strchr(tab3 + 1, '\t'); if (!tab4) continue; *tab4 = '\0';
+
+            signal = atoi(tab2 + 1);
+            char* ssid_ptr = tab4 + 1;
+            int slen = strlen(ssid_ptr);
+            while (slen > 0 && (ssid_ptr[slen-1] == '\n' || ssid_ptr[slen-1] == '\r')) {
+                ssid_ptr[slen-1] = '\0';
+                slen--;
+            }
+            strncpy(ssid, ssid_ptr, sizeof(ssid) - 1);
+
+            if (strlen(ssid) > 0) {
+                strncpy(local_ssid[local_count], ssid, sizeof(local_ssid[0]) - 1);
+                local_ssid[local_count][sizeof(local_ssid[0]) - 1] = '\0';
+                local_signal[local_count] = signal;
+                local_count++;
+            }
+        }
+        pclose(fp);
+    }
+
+    /* Only now grab the lock to write shared state */
+    pthread_mutex_lock(&ui_lock);
+    wifi_count = local_count;
+    for (int i = 0; i < local_count; i++) {
+        strncpy(wifi_ssid[i], local_ssid[i], sizeof(wifi_ssid[i]) - 1);
+        wifi_ssid[i][sizeof(wifi_ssid[i]) - 1] = '\0';
+        wifi_signal[i] = local_signal[i];
+    }
+    wifi_scanning = 0;
+    snprintf(status_msg, sizeof(status_msg), "扫描完成，发现 %d 个网络", local_count);
+    ui_needs_redraw = 1;  /* main loop will render */
+    pthread_mutex_unlock(&ui_lock);
+    return NULL;
+}
+
+static void* weather_thread_func(void* arg) {
+    pthread_mutex_lock(&ui_lock);
+    snprintf(status_msg, sizeof(status_msg), "正在获取天气预报...");
+    ui_needs_redraw = 1;  /* main loop renders */
+    pthread_mutex_unlock(&ui_lock);
+
+    char cmd[512];
+    snprintf(cmd, sizeof(cmd), "ssh -o StrictHostKeyChecking=no cyj@%s 'python3 /home/cyj/workspace/ai_assistant/get_weather.py' 2>/dev/null", g_wsl_ip);
+    /* FIX: All blocking I/O (popen+fgets over SSH) runs OUTSIDE the lock.
+     * ui_lock is only held for brief shared-state writes + redraws. */
+    char local_wuhan[128] = {0};
+    char local_beijing[128] = {0};
+    int success = 0;
+    FILE* fp = popen(cmd, "r");
+    if (fp) {
+        char buf[256] = {0};
+        if (fgets(buf, sizeof(buf), fp)) {
+            int len = strlen(buf);
+            while (len > 0 && (buf[len-1] == '\n' || buf[len-1] == '\r')) {
+                buf[len-1] = '\0';
+                len--;
+            }
+            char* parts = strchr(buf, '|');
+            if (parts) {
+                *parts = '\0';
+                char* wh = strchr(buf, ':');
+                char* bj = strchr(parts + 1, ':');
+                if (wh && bj) {
+                    strncpy(local_wuhan, wh + 1, sizeof(local_wuhan) - 1);
+                    strncpy(local_beijing, bj + 1, sizeof(local_beijing) - 1);
+                    success = 1;
+                }
+            }
+        }
+        pclose(fp);
+    }
+
+    /* Only now grab the lock to write shared state + redraw */
+    pthread_mutex_lock(&ui_lock);
+    if (success) {
+        strncpy(weather_info_wuhan, local_wuhan, sizeof(weather_info_wuhan) - 1);
+        strncpy(weather_info_beijing, local_beijing, sizeof(weather_info_beijing) - 1);
+        snprintf(status_msg, sizeof(status_msg), "天气更新完成");
+    } else {
+        snprintf(status_msg, sizeof(status_msg), "获取天气失败");
+    }
+    ui_needs_redraw = 1;  /* main loop renders */
+    pthread_mutex_unlock(&ui_lock);
+    return NULL;
+}
+
+static void* listener_thread(void* arg) {
+    int server_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (server_fd < 0) return NULL;
+    int opt = 1;
+    setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
+    struct sockaddr_in addr;
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = INADDR_ANY;
+    addr.sin_port = htons(CONTROL_PORT);
+
+    if (bind(server_fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+        close(server_fd);
+        return NULL;
+    }
+    if (listen(server_fd, 3) < 0) {
+        close(server_fd);
+        return NULL;
+    }
+
+    printf("[Listener] TCP server listening on port %d...\n", CONTROL_PORT);
+
+    while (1) {
+        struct sockaddr_in caddr;
+        socklen_t clen = sizeof(caddr);
+        int csock = accept(server_fd, (struct sockaddr*)&caddr, &clen);
+        if (csock < 0) continue;
+
+        char buf[1024] = {0};
+        int len = recv(csock, buf, sizeof(buf) - 1, 0);
+        if (len > 0) {
+            buf[len] = '\0';
+            printf("[Listener] Received AI command: %s\n", buf);
+
+            // Play the received wav file in background
+            system("aplay -D plughw:1,0 /root/code/reply.wav >/dev/null 2>&1 &");
+
+            pthread_mutex_lock(&ui_lock);
+            if (chat_lines < MAX_CHAT) {
+                snprintf(chat_text[chat_lines], 256, "< AI: %s", buf);
+                chat_lines++;
+            }
+            snprintf(status_msg, sizeof(status_msg), "AI: %s", buf);
+            ui_needs_redraw = 1;  /* main loop will render */
+            pthread_mutex_unlock(&ui_lock);
+        }
+        close(csock);
+    }
+    close(server_fd);
+    return NULL;
+}
+
+/* WAV binary listener: 接收 WSL 端 SCP 失败时的降级 WAV 数据 */
+static void* wav_listener_thread(void* arg) {
+    int server_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (server_fd < 0) return NULL;
+    int opt = 1;
+    setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
+    struct sockaddr_in addr;
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = INADDR_ANY;
+    addr.sin_port = htons(WAV_DATA_PORT);
+
+    if (bind(server_fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+        printf("[WAV Listener] Port %d bind failed, skip wav receiver\n", WAV_DATA_PORT);
+        close(server_fd);
+        return NULL;
+    }
+    if (listen(server_fd, 3) < 0) {
+        close(server_fd);
+        return NULL;
+    }
+
+    printf("[WAV Listener] TCP server listening on port %d...\n", WAV_DATA_PORT);
+
+    while (1) {
+        struct sockaddr_in caddr;
+        socklen_t clen = sizeof(caddr);
+        int csock = accept(server_fd, (struct sockaddr*)&caddr, &clen);
+        if (csock < 0) continue;
+
+        /* 读取 4 字节长度头 */
+        uint32_t data_len = 0;
+        int n = recv(csock, &data_len, 4, MSG_WAITALL);
+        if (n != 4 || data_len == 0 || data_len > 1024*1024) {
+            close(csock);
+            continue;
+        }
+        data_len = ntohl(data_len);
+
+        /* 读取 WAV 数据并写入文件 */
+        FILE* fp = fopen("/root/code/reply.wav", "wb");
+        if (!fp) { close(csock); continue; }
+
+        char buf[8192];
+        uint32_t remaining = data_len;
+        while (remaining > 0) {
+            int chunk = remaining > sizeof(buf) ? sizeof(buf) : remaining;
+            int r = recv(csock, buf, chunk, 0);
+            if (r <= 0) break;
+            fwrite(buf, 1, r, fp);
+            remaining -= r;
+        }
+        fclose(fp);
+        close(csock);
+
+        struct stat st;
+        if (stat("/root/code/reply.wav", &st) == 0 && st.st_size > 1000) {
+            printf("[WAV Listener] Received wav (%ld bytes), playing...\n", (long)st.st_size);
+            system("aplay -D plughw:1,0 /root/code/reply.wav >/dev/null 2>&1 &");
+        } else {
+            printf("[WAV Listener] WAV file invalid, skip playback\n");
+        }
+    }
+    close(server_fd);
+    return NULL;
+}
+
+
+/* ===== Page Renderers ===== */
+
+
+static void draw_card(int x1,int y1,int x2,int y2,const char* title){
+    draw_rect_round(x1,y1,x2,y2,8,0xFF18314A);
+    draw_rect_round(x1+1,y1+1,x2-1,y2-1,8,0xFF10263A);
+    if(title) draw_text(x1+16,y1+14,title,0xFFFFFFFF,2);
+}
+static void draw_top_bar(const char* title,const char* icon,int back,int show_bt){
+    draw_rect(0,0,SCREEN_W,62,0xFF041320); draw_rect(0,61,SCREEN_W,62,0xFF1E3A55);
+    if(back) draw_text(18,16,"<",0xFFEAF2FF,3);
+    draw_text(back?70:18,12,icon,0xFF2B8CFF,3); draw_text(back?116:62,8,title,0xFFFFFFFF,3);
+    if(!back) draw_text(62,38,"RK1808 Dev Board",0xFFD8DEE9,1);
+    draw_text(410,10,"CPU",0xFFFFFFFF,1); draw_text(410,28,"32%",0xFFFFFFFF,1); draw_rect_round(410,45,475,49,2,0xFF31465A); draw_rect_round(410,45,462,49,2,0xFF2B8CFF);
+    draw_text(535,10,"RAM",0xFFFFFFFF,1); draw_text(535,28,"48%",0xFFFFFFFF,1); draw_rect_round(535,45,600,49,2,0xFF31465A); draw_rect_round(535,45,566,49,2,0xFF2B8CFF);
+    draw_text(660,10,"Wi-Fi",0xFFFFFFFF,1); draw_text(660,31,"已连接",0xFFFFFFFF,1);
+    if(show_bt){ draw_text(735,10,"蓝牙",0xFFFFFFFF,1); draw_text(735,31,"已连接",0xFFFFFFFF,1); }
+    draw_text(790,18,"85%",0xFFFFFFFF,2); draw_text(905,8,"15:30:25",0xFFFFFFFF,2); draw_text(905,35,"2025-05-20",0xFFFFFFFF,1);
+}
+static void draw_sidebar(const char* active){
+    draw_rect(0,62,160,SCREEN_H,0xFF06172A); draw_rect(159,62,160,SCREEN_H,0xFF1F4A78);
+    const char* items[]={"首页","AI交互","天气查询","相册查询","文件查询","设置"};
+    for(int i=0;i<6;i++){ int y=86+i*72; if(strcmp(active,items[i])==0) draw_rect_round(8,y,150,y+48,5,0xFF1268DD); draw_text(48,y+14,items[i],0xFFFFFFFF,2); }
+}
+static void draw_status_footer(){ draw_text(330,580,status_msg,0xFF9FB3C8,1); }
+
+static void render_home_page(){
+    draw_rect(0,0,SCREEN_W,SCREEN_H,0xFF071827); draw_top_bar("开发板主界面","[]",0,1); draw_sidebar("首页");
+    draw_card(180,82,425,342,"1. AI交互");
+    draw_rect_round(268,132,410,198,8,0xFF155BD3); draw_text(282,145,"我",0xFFFFFFFF,1); draw_text(282,168,"今天天气怎么样？",0xFFFFFFFF,1);
+    draw_text(228,218,"AI助手",0xFFD8DEE9,1); draw_rect_round(224,238,370,295,8,0xFF26384A); draw_text(238,252,"深圳，28℃，多云，",0xFFFFFFFF,1); draw_text(238,274,"适合出行。",0xFFFFFFFF,1); draw_rect_round(278,304,338,364,30,0xFF1E73E8); draw_text(300,322,"●",0xFFFFFFFF,2);
+    draw_card(442,82,702,342,"2. 天气查询"); draw_text(474,135,"深圳",0xFFFFFFFF,2); draw_text(475,175,"云",0xFFFFFFFF,4); draw_text(548,166,"28℃",0xFFFFFFFF,4); draw_text(552,218,"多云",0xFFFFFFFF,2); draw_text(474,252,"湿度：68%   |   风速：3级",0xFFD8DEE9,1); draw_text(474,300,"明天 27/32℃   后天 26/31℃",0xFFFFFFFF,1);
+    draw_card(718,82,1000,342,"3. 相册查询"); for(int r=0;r<2;r++)for(int c=0;c<2;c++){int x=732+c*132,y=130+r*88; draw_rect_round(x,y,x+118,y+76,4,0xFF2D6E9F); draw_text(x+35,y+25,(r+c)%2?"照片":"风景",0xFFFFFFFF,1);} draw_text(820,320,"共 128 张照片",0xFFFFFFFF,1);
+    draw_card(180,356,612,566,"4. 文件查询"); draw_text(204,405,"名称              类型       大小       修改时间",0xFFD8DEE9,1); draw_text(204,435,"[D] 文档          文件夹     —      2025-05-20",0xFFFFFFFF,1); draw_text(204,462,"[D] 图片          文件夹     —      2025-05-20",0xFFFFFFFF,1); draw_text(204,489,"main.c           C 文件     3.2KB",0xFFFFFFFF,1); draw_text(204,516,"config.json      JSON文件   1.1KB",0xFFFFFFFF,1);
+    draw_card(628,356,1000,566,"5. 设置"); draw_text(652,404,"Wi-Fi        已连接  TP-Link_5G    >",0xFFFFFFFF,1); draw_text(652,440,"蓝牙         已连接               >",0xFFFFFFFF,1); draw_text(652,476,"亮度         ======== 70%",0xFFFFFFFF,1); draw_text(652,512,"音量         ====== 60%",0xFFFFFFFF,1); draw_status_footer();
+}
+static void render_voice_page(){
+    draw_rect(0,0,SCREEN_W,SCREEN_H,0xFF071827); draw_top_bar("AI交互","AI",1,0); draw_sidebar("AI交互"); draw_card(168,74,1014,588,NULL);
+    draw_text(530,104,"AI助手   今天 15:29",0xFFB9C7D6,1); draw_rect_round(775,135,958,222,8,0xFF155BD3); draw_text(792,154,"我",0xFFFFFFFF,1); draw_text(792,180,"今天天气怎么样？",0xFFFFFFFF,2); draw_text(910,205,"15:29",0xFFEAF2FF,1);
+    draw_rect_round(226,228,470,312,8,0xFF26384A); draw_text(242,246,"AI助手",0xFFB9C7D6,1); draw_text(242,274,"深圳，28℃，多云，适合出行。",0xFFFFFFFF,2); draw_text(426,298,"15:29",0xFFEAF2FF,1);
+    draw_rect_round(520,336,620,436,50,0xFF1E73E8); draw_text(555,366,"●",0xFFFFFFFF,3); draw_text(546,454,rec_state?"录音中":"点击说话",0xFFFFFFFF,1);
+    draw_rect_round(184,476,890,520,8,0xFF14283C); draw_text(202,492,"输入文字或点击语音按钮说话...",0xFF8EA0B3,1); draw_rect_round(910,476,1000,520,8,0xFF1268DD); draw_text(942,492,"发送",0xFFFFFFFF,2);
+    draw_rect_round(184,534,444,578,8,0xFF14283C); draw_text(280,550,"语音输入",0xFF2B8CFF,2); draw_rect_round(462,534,710,578,8,0xFF14283C); draw_text(560,550,"文本输入",0xFFFFFFFF,2); draw_rect_round(730,534,1000,578,8,0xFF14283C); draw_text(820,550,"清空对话",0xFFFFFFFF,2);
+}
+static void render_smart_page(){
+    draw_rect(0,0,SCREEN_W,SCREEN_H,0xFF071827); draw_top_bar("天气查询","云",1,0); draw_card(25,78,998,124,NULL); draw_text(45,92,"深圳",0xFFFFFFFF,2); draw_text(930,92,"刷新",0xFFFFFFFF,1);
+    draw_card(25,138,650,382,"当前天气"); draw_text(45,186,"15:30 更新",0xFFD8DEE9,1); draw_text(160,220,"云",0xFFFFFFFF,5); draw_text(298,182,"28℃",0xFFFFFFFF,5); draw_text(300,268,"多云",0xFFFFFFFF,3); draw_text(142,330,"湿度 68%",0xFFFFFFFF,1); draw_text(315,330,"东南风 3级",0xFFFFFFFF,2); draw_text(525,330,"优 28",0xFF55D66B,2);
+    draw_card(662,138,998,562,"日出日落"); draw_text(705,270,"05:50 日出",0xFFFFFFFF,2); draw_text(860,270,"19:00 日落",0xFFFFFFFF,2); draw_text(682,350,"逐小时预报",0xFFFFFFFF,2); for(int i=0;i<6;i++){char b[32]; sprintf(b,"%02d:00",16+i); draw_text(680+i*52,400,b,0xFFD8DEE9,1); draw_text(680+i*52,430,"云",0xFFFFFFFF,1); sprintf(b,"%d℃",28-(i>1?i-1:0)); draw_text(680+i*52,470,b,0xFFFFFFFF,1);}
+    draw_card(25,394,650,562,"4天预报"); draw_text(70,440,"明天 05/21   多云   27℃ / 32℃",0xFFFFFFFF,2); draw_text(70,485,"后天 05/22   小雨   26℃ / 31℃",0xFFFFFFFF,2); draw_text(70,530,"周五 05/23   多云   27℃ / 32℃",0xFFFFFFFF,2); draw_text(360,578,"数据来源：中国天气网    |    最后更新：2025-05-20 15:30",0xFF9FB3C8,1);
+}
+static void render_images_page(){
+    draw_rect(0,0,SCREEN_W,SCREEN_H,0xFF071827); draw_top_bar("相册查询","图",1,0); draw_card(16,78,318,566,NULL); draw_rect_round(30,92,304,278,6,0xFF2D6E9F); draw_text(48,296,"IMG_20250520_142015.jpg",0xFFFFFFFF,1); draw_text(48,326,"2025-05-20 14:20:15",0xFFD8DEE9,1); draw_text(48,356,"4.2 MB  |  4032x3024",0xFFD8DEE9,1); draw_text(48,420,"位置                 深圳市 南山区",0xFFFFFFFF,1); draw_text(48,455,"设备                 Camera",0xFFFFFFFF,1); draw_text(48,490,"描述                 美丽的湖光山色",0xFFFFFFFF,1);
+    draw_card(334,78,1008,566,NULL); draw_text(350,100,"全部    风景    城市    人物    收藏",0xFFFFFFFF,2); draw_text(884,100,"共 128 张照片",0xFFFFFFFF,1); for(int r=0;r<3;r++)for(int c=0;c<4;c++){int x=346+c*166,y=148+r*134; draw_rect_round(x,y,x+154,y+112,5,0xFF2D6E9F); draw_text(x+48,y+45,(r+c)%3==0?"风景":((r+c)%3==1?"城市":"自然"),0xFFFFFFFF,1);} draw_status_footer();
+}
+static void render_bmpview_page(){ render_images_page(); }
+static void render_files_page(){
+    draw_rect(0,0,SCREEN_W,SCREEN_H,0xFF071827); draw_top_bar("文件查询","<",1,0); draw_card(15,84,1010,190,NULL); draw_text(32,110,"存储设备   >   home   >   rk1808   >   workspace   >   project",0xFFFFFFFF,2); draw_rect_round(765,104,995,142,6,0xFF14283C); draw_text(802,116,"搜索文件或文件夹",0xFFB9C7D6,1); draw_rect_round(30,146,150,182,5,0xFF1268DD); draw_text(50,156,"+ 新建文件夹",0xFFFFFFFF,1); draw_text(185,156,"复制        删除        重命名",0xFFFFFFFF,1);
+    draw_card(15,204,1010,575,NULL); draw_text(95,232,"名称",0xFFFFFFFF,2); draw_text(450,232,"类型",0xFFFFFFFF,2); draw_text(610,232,"大小",0xFFFFFFFF,2); draw_text(800,232,"修改时间",0xFFFFFFFF,2);
+    const char* rows[][4]={{"[D] 文档","文件夹","—","2025-05-20 14:20"},{"[D] 图片","文件夹","—","2025-05-20 14:18"},{"main.c","C 文件","3.2 KB","2025-05-20 13:55"},{"config.json","JSON 文件","1.1 KB","2025-05-20 13:50"},{"readme.md","MD 文件","2.0 KB","2025-05-20 13:45"},{"数据记录.xlsx","XLSX 文件","12.6 KB","2025-05-20 13:40"}};
+    for(int i=0;i<6;i++){int y=280+i*47; draw_text(95,y,rows[i][0],0xFFFFFFFF,2); draw_text(450,y,rows[i][1],0xFFFFFFFF,1); draw_text(610,y,rows[i][2],0xFFFFFFFF,1); draw_text(800,y,rows[i][3],0xFFFFFFFF,1);} draw_text(35,552,"共 6 项",0xFFFFFFFF,1); draw_text(760,552,"第 1 页，共 1 页",0xFFFFFFFF,1);
+}
+static void render_settings_page(){
+    draw_rect(0,0,SCREEN_W,SCREEN_H,0xFF071827); draw_top_bar("设置","*",0,1); draw_rect(0,62,205,SCREEN_H,0xFF06172A); const char* it[]={"网络","蓝牙","显示","声音","存储","系统信息"}; for(int i=0;i<6;i++){int y=86+i*72; if(i==0) draw_rect_round(15,y,188,y+48,5,0xFF1268DD); draw_text(70,y+14,it[i],0xFFFFFFFF,2);}
+    draw_card(222,74,1005,588,"网络"); draw_rect_round(244,120,985,225,8,0xFF14283C); draw_text(265,145,"Wi-Fi",0xFFFFFFFF,2); draw_text(770,145,"已连接  TP-Link_5G   >",0xFFFFFFFF,1); draw_text(265,184,"IP 地址",0xFFD8DEE9,1); draw_text(815,184,"192.168.1.100",0xFFFFFFFF,1); draw_text(265,208,"MAC 地址",0xFFD8DEE9,1); draw_text(790,208,"3C:5A:B4:18:08:08",0xFFFFFFFF,1);
+    draw_rect_round(244,236,985,294,8,0xFF14283C); draw_text(265,252,"蓝牙",0xFFFFFFFF,2); draw_text(760,252,"已连接",0xFFFFFFFF,1); draw_text(265,278,"蓝牙已开启，可被发现为 RK1808",0xFFD8DEE9,1);
+    draw_rect_round(244,306,985,364,8,0xFF14283C); draw_text(265,322,"显示  亮度",0xFFFFFFFF,2); draw_text(650,328,"========== 70%  >",0xFFFFFFFF,1);
+    draw_rect_round(244,376,985,434,8,0xFF14283C); draw_text(265,392,"声音  音量",0xFFFFFFFF,2); draw_text(650,398,"======== 60%  >",0xFFFFFFFF,1);
+    draw_rect_round(244,446,985,504,8,0xFF14283C); draw_text(265,462,"存储  内部存储",0xFFFFFFFF,2); draw_text(650,468,"已使用 12.8 GB / 32.0 GB  >",0xFFFFFFFF,1);
+    draw_rect_round(244,516,985,576,8,0xFF14283C); draw_text(265,532,"系统信息",0xFFFFFFFF,2); draw_text(800,532,"RK1808 Dev Board",0xFFFFFFFF,1); draw_text(800,558,"Linux 5.10.110",0xFFFFFFFF,1);
+}
+static void render_page(){
+    switch(cur_page){
+        case PAGE_HOME: render_home_page(); break;
+        case PAGE_VOICE: render_voice_page(); break;
+        case PAGE_SMART: render_smart_page(); break;
+        case PAGE_IMAGES: render_images_page(); break;
+        case PAGE_SETTINGS: render_settings_page(); break;
+        case PAGE_BMPVIEW: render_bmpview_page(); break;
+        case PAGE_FILES: render_files_page(); break;
+        default: render_home_page(); break;
+    }
+}
+
+static void handle_touch(int px, int py) {
+    if (pt_in_rect(px, py, back_btn) && cur_page != PAGE_HOME) {
+        if (cur_page == PAGE_BMPVIEW) {
+            cur_page = PAGE_IMAGES;
+        } else {
+            cur_page = PAGE_HOME;
+        }
+        snprintf(status_msg, sizeof(status_msg), "AI ready");
+        ui_needs_redraw = 1;
+        return;
+    }
+    switch (cur_page) {
+        case PAGE_HOME:
+            if (pt_in_rect(px, py, home_voice_btn)) {
+                cur_page = PAGE_VOICE;
+                snprintf(status_msg, sizeof(status_msg), "Voice Assistant");
+                ui_needs_redraw = 1;
+            } else if (pt_in_rect(px, py, home_smart_btn)) {
+                cur_page = PAGE_SMART;
+                snprintf(status_msg, sizeof(status_msg), "Smart Home");
+                ui_needs_redraw = 1;
+                // Fetch weather immediately when entering the weather page
+                pthread_t tid;
+                pthread_create(&tid, NULL, weather_thread_func, NULL);
+                pthread_detach(tid);
+            } else if (pt_in_rect(px, py, home_images_btn)) {
+                scan_bmp_dir();
+                bmp_scroll = 0;
+                cur_page = PAGE_IMAGES;
+                snprintf(status_msg, sizeof(status_msg), "Image Browser");
+                ui_needs_redraw = 1;
+            } else if (pt_in_rect(px, py, home_files_btn)) {
+                cur_page = PAGE_FILES;
+                snprintf(status_msg, sizeof(status_msg), "File Browser");
+                ui_needs_redraw = 1;
+            } else if (pt_in_rect(px, py, home_sett_btn)) {
+                cur_page = PAGE_SETTINGS;
+                snprintf(status_msg, sizeof(status_msg), "Settings");
+                ui_needs_redraw = 1;
+            }
+            break;
+        case PAGE_VOICE:
+            if (pt_in_rect(px, py, voice_mic_btn)) {
+                if (!rec_state) {
+                    pthread_t tid;
+                    pthread_create(&tid, NULL, record_thread_func, NULL);
+                    pthread_detach(tid);
+                }
+            } else if (pt_in_rect(px, py, voice_send_btn)) {
+                pthread_t tid;
+                pthread_create(&tid, NULL, send_thread_func, NULL);
+                pthread_detach(tid);
+            }
+            break;
+        case PAGE_SMART:
+            // Click anywhere to refresh weather
+            if (py >= 100 && py <= 500) {
+                pthread_t tid;
+                pthread_create(&tid, NULL, weather_thread_func, NULL);
+                pthread_detach(tid);
+            }
+            break;
+        case PAGE_IMAGES:
+            if (pt_in_rect(px, py, img_up_btn) && bmp_scroll > 0) {
+                bmp_scroll--;
+                ui_needs_redraw = 1;
+            } else if (pt_in_rect(px, py, img_down_btn) && (bmp_scroll + 2) * 3 < bmp_count) {
+                bmp_scroll++;
+                ui_needs_redraw = 1;
+            } else {
+                for (int i = 0; i < 6; i++) {
+                    if (pt_in_rect(px, py, img_thumbs[i])) {
+                        int idx = i + bmp_scroll * 3;
+                        if (idx < bmp_count) {
+                            bmp_index = idx;
+                            cur_subpage = cur_page;
+                            cur_page = PAGE_BMPVIEW;
+                            snprintf(status_msg, sizeof(status_msg), "%s", bmp_files[idx]);
+                            ui_needs_redraw = 1;
+                        }
+                    }
+                }
+            }
+            break;
+        case PAGE_BMPVIEW:
+            if (pt_in_rect(px, py, bmp_prev_btn) && bmp_index > 0) {
+                bmp_index--;
+                snprintf(status_msg, sizeof(status_msg), "%s", bmp_files[bmp_index]);
+                ui_needs_redraw = 1;
+            } else if (pt_in_rect(px, py, bmp_next_btn) && bmp_index < bmp_count - 1) {
+                bmp_index++;
+                snprintf(status_msg, sizeof(status_msg), "%s", bmp_files[bmp_index]);
+                ui_needs_redraw = 1;
+            }
+            break;
+        case PAGE_SETTINGS:
+            if (pt_in_rect(px, py, sett_scan_btn)) {
+                pthread_t tid;
+                pthread_create(&tid, NULL, wifi_scan_thread_func, NULL);
+                pthread_detach(tid);
+            } else {
+                for (int i = 0; i < 6 && i < wifi_count; i++) {
+                    /* Dynamic hit region based on drawn layout */
+                    rect_t conn_btn = {SCREEN_W - 160, 165 + i*55 + 5, SCREEN_W - 50, 165 + i*55 + 40};
+                    if (pt_in_rect(px, py, conn_btn)) {
+                        snprintf(status_msg, sizeof(status_msg), "已选定: %s", wifi_ssid[i]);
+                        ui_needs_redraw = 1;
+                    }
+                }
+            }
+            break;
+    }
+}
+
+/* ===== Touch Thread ===== */
+void* touch_thread(void* arg) {
+    touch_fd = open(TOUCH_DEVICE, O_RDONLY);
+    if (touch_fd < 0) {
+        printf("[Touch] Failed to open %s\n", TOUCH_DEVICE);
+        return NULL;
+    }
+    struct input_event ev;
+    int pressed = 0, last_x = 0, last_y = 0;
+    while (1) {
+        if (read(touch_fd, &ev, sizeof(ev)) == sizeof(ev)) {
+            if (ev.type == EV_ABS) {
+                if (ev.code == ABS_X || ev.code == ABS_MT_POSITION_X) last_x = ev.value;
+                if (ev.code == ABS_Y || ev.code == ABS_MT_POSITION_Y) last_y = ev.value;
+            } else if (ev.type == EV_KEY && ev.code == BTN_TOUCH) {
+                if (ev.value == 1) {
+                    pressed = 1;
+                } else if (ev.value == 0 && pressed) {
+                    pressed = 0;
+                    int px = touch_map_x(last_x);
+                    int py = touch_map_y(last_y);
+                    printf("[Touch] (%d,%d) -> (%d,%d)\n", last_x, last_y, px, py);
+                    pthread_mutex_lock(&ui_lock);
+                    ui_needs_redraw = 0;
+                    handle_touch(px, py);
+                    int need_draw = ui_needs_redraw;
+                    pthread_mutex_unlock(&ui_lock);
+                    /* Render OUTSIDE the lock so other threads can update state */
+                    if (need_draw) {
+                        pthread_mutex_lock(&ui_lock);
+                        render_page();
+                        pthread_mutex_unlock(&ui_lock);
+                        DRMshowUp(lcd_fb, &DRM);
+                    }
+                }
+            }
+        }
+    }
+    close(touch_fd);
+    return NULL;
+}
+
+/* ===== Main ===== */
+int main(int argc, char* argv[]) {
+    if (argc >= 2) {
+        strncpy(g_wsl_ip, argv[1], sizeof(g_wsl_ip) - 1);
+        g_wsl_ip[sizeof(g_wsl_ip) - 1] = '\0';
+    }
+    printf("[UI] Target WSL IP: %s\n", g_wsl_ip);
+
+    printf("[UI] Initializing DRM...\n");
+    lcd_fb = open(DRM_DEVICE, O_RDWR);
+    if (lcd_fb < 0) {
+        perror("[DRM] Open error");
+        return 1;
+    }
+    DRMinit(lcd_fb);
+    int ret = DRMcreateFB(lcd_fb, &DRM);
+    if (ret < 0) {
+        printf("[UI] DRM createFB failed: %d\n", ret);
+        return 1;
+    }
+    printf("[UI] Screen %dx%d mapped\n", SCREEN_W, SCREEN_H);
+
+    /* Initialize TrueType font engine with stb_truetype */
+    if (font_init("/usr/share/fonts/truetype/wqy/wqy-microhei.ttc") == 0) {
+        printf("[Font] wqy-microhei.ttc loaded OK\n");
+    } else {
+        printf("[Font] WARNING: TTF not found, text display may be broken\n");
+    }
+
+    /* Clear screen to dark background via DRM color fill */
+    DRM_Color_Display(lcd_fb, 0x0f0f23);
+
+    scan_bmp_dir();
+    printf("[UI] Found %d BMP files\n", bmp_count);
+    snprintf(chat_text[0], 256, "Welcome to AI Assistant");
+    chat_lines = 1;
+    
+    // Start listener thread for AI responses
+    pthread_t listen_tid;
+    pthread_create(&listen_tid, NULL, listener_thread, NULL);
+    pthread_detach(listen_tid);
+
+    // Start WAV binary listener for SCP-fallback
+    pthread_t wav_tid;
+    pthread_create(&wav_tid, NULL, wav_listener_thread, NULL);
+    pthread_detach(wav_tid);
+
+    pthread_t tid;
+    pthread_create(&tid, NULL, touch_thread, NULL);
+    render_page();
+    DRMshowUp(lcd_fb, &DRM);
+    printf("[UI] Ready. Main render loop starting (30fps).\n");
+
+    /* Main render loop: all rendering happens here, NOT inside threads.
+     * Threads only flip ui_needs_redraw = 1 (under brief lock).
+     * This eliminates all lock-while-rendering deadlocks. */
+    while (1) {
+        usleep(33000);  /* ~30 fps poll */
+
+        /* Check if any thread wants a redraw */
+        int need_draw = 0;
+        pthread_mutex_lock(&ui_lock);
+        if (ui_needs_redraw) {
+            ui_needs_redraw = 0;
+            need_draw = 1;
+        }
+        /* msg_timer countdown (1 tick = 33ms) */
+        if (msg_timer > 0) {
+            msg_timer--;
+            if (msg_timer == 0) {
+                snprintf(status_msg, sizeof(status_msg), "AI ready");
+                need_draw = 1;
+            }
+        }
+        pthread_mutex_unlock(&ui_lock);
+
+        if (need_draw) {
+            /* Render with short lock, then flip outside lock */
+            pthread_mutex_lock(&ui_lock);
+            render_page();
+            pthread_mutex_unlock(&ui_lock);
+            DRMshowUp(lcd_fb, &DRM);
+        }
+    }
+    return 0;
+}
+

@@ -1,0 +1,64 @@
+import subprocess
+import os
+
+def fetch_weather(city):
+    try:
+        url = f"wttr.in/{city}?format=%t+%C"
+        # 10s timeout, using curl
+        res = subprocess.run(["curl", "-s", "-m", "10", url], capture_output=True, text=True)
+        if res.returncode == 0:
+            val = res.stdout.strip()
+            if val and "<html" not in val.lower() and len(val) < 40:
+                translations = {
+                    "Partly cloudy": "多云",
+                    "Partly Cloudy": "多云",
+                    "Sunny": "晴",
+                    "Clear": "晴",
+                    "Cloudy": "阴",
+                    "Overcast": "阴",
+                    "Rainy": "雨",
+                    "Light rain": "小雨",
+                    "Moderate rain": "中雨",
+                    "Heavy rain": "大雨",
+                    "Patchy rain possible": "局部有雨",
+                    "Smoky haze": "霾",
+                    "Mist": "雾",
+                    "Fog": "雾",
+                    "Snow": "雪",
+                    "Thunderstorm": "雷阵雨"
+                }
+                parts = val.split(" ")
+                temp = parts[0]
+                cond = " ".join(parts[1:])
+                cond_zh = translations.get(cond, cond)
+                return f"{temp} {cond_zh}"
+    except Exception:
+        pass
+    return None
+
+wuhan = fetch_weather("Wuhan")
+beijing = fetch_weather("Beijing")
+
+# Read existing cache if we failed to fetch new data
+cache_path = "/home/cyj/workspace/ai_assistant/weather_cache.txt"
+current_wuhan, current_beijing = "+28°C 晴", "+32°C 多云"
+
+if os.path.exists(cache_path):
+    try:
+        with open(cache_path, "r", encoding="utf-8") as f:
+            line = f.read().strip()
+            # Format: 武汉:xxx|北京:yyy
+            parts = line.split("|")
+            current_wuhan = parts[0].split(":")[1]
+            current_beijing = parts[1].split(":")[1]
+    except Exception:
+        pass
+
+if wuhan: current_wuhan = wuhan
+if beijing: current_beijing = beijing
+
+# Write back to cache
+with open(cache_path, "w", encoding="utf-8") as f:
+    f.write(f"武汉:{current_wuhan}|北京:{current_beijing}")
+
+print("Weather cache updated successfully.")

@@ -1,0 +1,60 @@
+import re
+import os
+from PIL import Image, ImageDraw, ImageFont
+
+# 69 Chinese characters in the exact order as defined in ui_client.c
+chars = "语音助手录发送就绪中间错误首页设置家居图片扫描连接信号强度网络刷新已浏览上下返回无灯光风扇窗帘温电门锁开关智能系统息地址存储编译部署管理于视"
+
+# Font file path (SimSun from Windows)
+font_path = "/mnt/c/Windows/Fonts/simsun.ttc"
+if not os.path.exists(font_path):
+    # Try alternative: SimHei
+    font_path = "/mnt/c/Windows/Fonts/simhei.ttf"
+
+print(f"Using font: {font_path}")
+font = ImageFont.truetype(font_path, 16)
+
+font_rows_list = []
+
+for idx, ch in enumerate(chars):
+    # Create 16x16 binary image
+    img = Image.new("1", (16, 16), 0)
+    draw = ImageDraw.Draw(img)
+    
+    # Draw character. SimHei or SimSun at 16pt might need slight vertical offset.
+    # SimSun at 16px fits perfectly when drawn at (0, -2) or (0, -1).
+    # Let's use (0, -2) which aligns standard 16x16 fonts perfectly.
+    draw.text((0, -2), ch, font=font, fill=1)
+    
+    rows = []
+    for y in range(16):
+        row_val = 0
+        for x in range(16):
+            if img.getpixel((x, y)):
+                # MSB-first bit packing (bit 15 is x=0, bit 14 is x=1, etc.)
+                row_val |= (1 << (15 - x))
+        rows.append(f"0x{row_val:04X}")
+    font_rows_list.append(rows)
+
+# Generate C array content
+c_array_lines = ["static const uint16_t cn_font16[][16] = {"]
+for idx, ch in enumerate(chars):
+    row_str = ", ".join(font_rows_list[idx])
+    c_array_lines.append(f"/* [{idx:2d}] {ch} */ {{{row_str}}},")
+c_array_lines.append("};")
+
+c_array_block = "\n".join(c_array_lines)
+
+# Read ui_client.c and patch it
+ui_client_path = "/home/cyj/workspace/ai_assistant/ui_client.c"
+with open(ui_client_path, "r", encoding="utf-8") as f:
+    content = f.read()
+
+# Regular expression to find and replace the cn_font16 array definition
+pattern = r"static const uint16_t cn_font16\[\]\[16\] = \{.*?^\};"
+modified_content = re.sub(pattern, c_array_block, content, flags=re.DOTALL | re.MULTILINE)
+
+with open(ui_client_path, "w", encoding="utf-8") as f:
+    f.write(modified_content)
+
+print("Successfully generated font glyphs and patched ui_client.c!")
